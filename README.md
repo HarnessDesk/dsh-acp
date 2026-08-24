@@ -151,6 +151,31 @@ Working and tested end to end against a real harness: streaming, reasoning, tool
 calls with output, plans, usage, permission prompts, the three session controls, and
 a conversation list carrying the harness's own session titles.
 
+A listed conversation only has a name if the composition generates one. The title
+service and its provider are separate plugins, and mounting them is what turns a row
+from a truncated first prompt into "Maximum landing score breakdown":
+
+```yaml
+- id: session-title
+  name: '@deepseek-ai/dsh-session-title'
+  config: { fallbackMaxWords: 5, fallbackMaxBytes: 40, maxTitleBytes: 80 }
+
+- id: session-title-llm
+  name: '@deepseek-ai/dsh-session-title-first-prompt-llm'
+  config:
+    targetWords: 5
+    targetCjkCharacters: 10
+    maxInputBytes: 4096
+    maxOutputTokens: 64
+    timeoutMs: 60000
+    provider: deepseek-official
+    model: deepseek-v4-flash
+```
+
+The service alone gives a word-count fallback title; the provider names the
+conversation with a cheap route instead. Without either, `session/list` still answers
+with a cwd and a preview, and `title` is `null`.
+
 Not implemented yet:
 
 - `session/load` — the capability is advertised as `false` rather than being claimed
