@@ -1,0 +1,38 @@
+{
+  "_provenance": [
+    "The three token-meter projections, recorded by folding DeepSeek Harness's",
+    "own projection units over `session-events.json` — the same recorded log the",
+    "rest of the suite runs on. Produced with:",
+    "",
+    "  const { contextBreakdownProjectionDefinition } =",
+    "    await import('@deepseek-ai/dsh-token-meter/lib/types/breakdown-projection.js')",
+    "  const { contextPressureProjectionDefinition, tokenUsageProjectionDefinition } =",
+    "    await import('@deepseek-ai/dsh-token-meter/lib/types/usage-projection.js')",
+    "  let s = def.init(); for (const e of events) s = def.apply(s, e); def.view(s)",
+    "",
+    "against @deepseek-ai/dsh-token-meter@0.1.0-rc.8 on 2026-08-24. These are the",
+    "harness's numbers, not this adapter's: the values it would publish for this",
+    "session, so a change in what the adapter does with them shows up here as a",
+    "changed mapping rather than as a changed measurement.",
+    "",
+    "Note that `systemTokens` and `toolsTokens` are small because the recorded",
+    "header's `system` text and tool descriptions were elided when the log was",
+    "captured. That does not affect what the tests check, which is the mapping."
+  ],
+  "tokenUsage": {
+    "uncachedInputTokens": 4214,
+    "outputTokens": 32595,
+    "cacheReadTokens": 92032,
+    "cacheWriteTokens": 0
+  },
+  "contextPressure": {
+    "pressureTokens": 43574,
+    "projectedTokens": 43574,
+    "contextWindow": 1000000
+  },
+  "contextBreakdown": {
+    "systemTokens": 44,
+    "toolsTokens": 771,
+    "messageTokens": 325
+  }
+}

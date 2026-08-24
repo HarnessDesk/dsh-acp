@@ -51,11 +51,34 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled'
 /**
  * The cordis context, narrowed. `on` is deliberately loose: cordis events are
  * a registry the host owns, and enumerating them here would be another pin.
+ *
+ * `inject` is the host's optional-dependency mechanism: the callback runs
+ * with a context on which the named services exist, and never runs at all in
+ * a composition that does not mount them. It is how an adapter reads a
+ * capability it would like without requiring it.
  */
 export interface HarnessContext {
   readonly agents: HarnessAgents
   readonly logger?: { warn(message: string): void; info?(message: string): void }
   on(event: string, listener: (...args: never[]) => unknown): unknown
+  inject(services: readonly string[], apply: (...args: never[]) => unknown): unknown
+}
+
+/**
+ * The context inside `inject(['sessionProjections'], …)`.
+ *
+ * `@deepseek-ai/dsh-session-projection` drives every registered unit forward
+ * over committed session events and notifies this feed with the unit's whole
+ * current value — the "whole-value event rule" its own module documentation
+ * calls load-bearing, and the reason this adapter never has to reduce a
+ * delta itself.
+ */
+export interface HarnessProjectionContext {
+  readonly sessionProjections: {
+    onChanged(
+      listener: (session: HarnessSession, key: string, value: unknown, seq: number) => void,
+    ): () => void
+  }
 }
 
 /**

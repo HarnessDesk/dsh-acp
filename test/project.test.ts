@@ -14,6 +14,14 @@ const fixtures = JSON.parse(
   readFileSync(fileURLToPath(new URL('./fixtures/session-events.json', import.meta.url)), 'utf8'),
 ) as DshEvent[]
 
+/** The harness's own projection values for that same log; see its `_provenance`. */
+const projections = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./fixtures/context-projections.json', import.meta.url)), 'utf8'),
+) as {
+  contextPressure: { pressureTokens: number; projectedTokens: number; contextWindow: number }
+  contextBreakdown: { systemTokens: number; toolsTokens: number; messageTokens: number }
+}
+
 const eventsOf = (type: string): DshEvent[] => fixtures.filter((event) => event.type === type)
 
 const project = (events: readonly DshEvent[]): AcpUpdate[] => {
@@ -26,7 +34,7 @@ const kinds = (updates: readonly AcpUpdate[]): string[] => updates.map((u) => u.
 describe('fixtures', () => {
   it('carry the event types the mapper claims to handle', () => {
     const types = new Set(fixtures.map((event) => event.type))
-    for (const type of ['request/context', 'assistant/chunk', 'tool/call', 'tool/result', 'todo/write']) {
+    for (const type of ['request/header', 'request/context', 'assistant/chunk', 'tool/call', 'tool/result', 'todo/write']) {
       expect(types, `fixture set is missing ${type}`).toContain(type)
     }
   })
@@ -115,6 +123,112 @@ describe('context window and usage', () => {
     // would not have caught the mismatch.
     projection.endTurn()
     expect(projection.promptUsage()).toBeUndefined()
+  })
+})
+
+describe('the token meter\'s projections', () => {
+  const { contextPressure, contextBreakdown } = projections
+
+  it('takes occupancy from the meter in preference to the per-request sum', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'request/context', data: { contextWindow: 1000 } })
+    projection.onEvent({
+      type: 'assistant/chunk',
+      data: { chunk: { type: 'usage', usage: { inputTokens: 10, cacheReadTokens: 90 } } },
+    })
+    // The meter has seen a compaction the event stream cannot report, so its
+    // figure is lower than the last request's. The lower one is the true one.
+    const updates = projection.onProjection('contextPressure', { projectedTokens: 60, contextWindow: 1000 })
+    expect(updates).toEqual([{ sessionUpdate: 'usage_update', used: 60, size: 1000 }])
+  })
+
+  it('prefers the projected figure, which is the one compaction moves', () => {
+    const projection = new SessionProjection()
+    const [update] = projection.onProjection('contextPressure', {
+      pressureTokens: 900,
+      projectedTokens: 400,
+      contextWindow: 1000,
+    })
+    expect(update).toEqual({ sessionUpdate: 'usage_update', used: 400, size: 1000 })
+  })
+
+  it('learns the window from the meter when no request/context has landed', () => {
+    const projection = new SessionProjection()
+    projection.onProjection('contextPressure', contextPressure)
+    expect(projection.contextWindow).toBe(contextPressure.contextWindow)
+  })
+
+  it('carries the composition beside the occupancy it explains', () => {
+    const projection = new SessionProjection()
+    projection.onProjection('contextPressure', contextPressure)
+    const [update] = projection.onProjection('contextBreakdown', contextBreakdown)
+    expect(update).toEqual({
+      sessionUpdate: 'usage_update',
+      used: contextPressure.projectedTokens,
+      size: contextPressure.contextWindow,
+      _meta: {
+        harnessdesk: {
+          contextBreakdown: {
+            approximate: true,
+            source: 'DeepSeek Harness token meter',
+            segments: [
+              { id: 'system', label: 'System prompt', tokens: contextBreakdown.systemTokens },
+              { id: 'tools', label: 'Tool schemas', tokens: contextBreakdown.toolsTokens },
+              { id: 'messages', label: 'Messages', tokens: contextBreakdown.messageTokens },
+            ],
+          },
+        },
+      },
+    })
+  })
+
+  it('marks the composition approximate, because the harness does', () => {
+    const projection = new SessionProjection()
+    projection.onProjection('contextPressure', contextPressure)
+    const [update] = projection.onProjection('contextBreakdown', contextBreakdown)
+    const meta = update?.sessionUpdate === 'usage_update' ? update._meta : undefined
+    const breakdown = meta?.harnessdesk?.contextBreakdown
+    expect(breakdown?.approximate).toBe(true)
+    // The segments are the meter's density estimate and `used` is anchored to
+    // what the provider charged. They are not the same measurement and the
+    // wire must not imply that they are, so no total is ever sent.
+    expect(breakdown).not.toHaveProperty('totalTokens')
+  })
+
+  it('counts the tool schemas exactly, off the request envelope', () => {
+    const projection = new SessionProjection()
+    projection.onProjection('contextPressure', contextPressure)
+    for (const event of eventsOf('request/header')) projection.onEvent(event)
+    const [update] = projection.onProjection('contextBreakdown', contextBreakdown)
+    const meta = update?.sessionUpdate === 'usage_update' ? update._meta : undefined
+    const tools = meta?.harnessdesk?.contextBreakdown?.segments.find((s) => s.id === 'tools')
+    const recorded = eventsOf('request/header').at(-1)?.data as { header: { tools: unknown[] } }
+    expect(tools?.count).toBe(recorded.header.tools.length)
+  })
+
+  it('drops a segment nobody measured rather than reporting it as zero', () => {
+    const projection = new SessionProjection()
+    projection.onProjection('contextPressure', contextPressure)
+    const [update] = projection.onProjection('contextBreakdown', { messageTokens: 120 })
+    const meta = update?.sessionUpdate === 'usage_update' ? update._meta : undefined
+    expect(meta?.harnessdesk?.contextBreakdown?.segments.map((s) => s.id)).toEqual(['messages'])
+  })
+
+  it('ignores projection keys it does not own, and non-values', () => {
+    const projection = new SessionProjection()
+    expect(projection.onProjection('tokenUsage', { outputTokens: 5 })).toEqual([])
+    expect(projection.onProjection('contextPressure', null)).toEqual([])
+    expect(projection.onProjection('contextBreakdown', { systemTokens: 0 })).toEqual([])
+  })
+
+  it('still draws a ring in a composition with no meter at all', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'request/context', data: { contextWindow: 1000 } })
+    const updates = projection.onEvent({
+      type: 'assistant/chunk',
+      data: { chunk: { type: 'usage', usage: { inputTokens: 10, cacheReadTokens: 90 } } },
+    })
+    expect(updates).toEqual([{ sessionUpdate: 'usage_update', used: 100, size: 1000 }])
   })
 })
 
