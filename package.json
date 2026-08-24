@@ -1,0 +1,42 @@
+{
+  "name": "@harnessdesk/dsh-acp",
+  "version": "0.1.0",
+  "description": "A complete Agent Client Protocol server for DeepSeek Harness — streams reasoning, tool calls, plans, and token usage that the harness's own automation bridge withholds.",
+  "keywords": ["acp", "agent-client-protocol", "deepseek", "deepseek-harness", "dsh", "harnessdesk"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/HarnessDesk/HarnessDesk.git" },
+  "bugs": { "url": "https://github.com/HarnessDesk/HarnessDesk/issues" },
+  "homepage": "https://github.com/HarnessDesk/HarnessDesk#readme",
+  "type": "module",
+  "engines": { "node": ">=22.15" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": { "harnessdesk-dsh-acp": "./dist/bin.js" },
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./plugin": { "types": "./dist/plugin.d.ts", "default": "./dist/plugin.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
