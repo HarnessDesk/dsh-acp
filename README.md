@@ -1,6 +1,6 @@
-# HarnessDesk — a complete ACP server for DeepSeek Harness
+# dsh-acp — a complete ACP server for DeepSeek Harness
 
-[![CI](https://github.com/HarnessDesk/HarnessDesk/actions/workflows/ci.yml/badge.svg)](https://github.com/HarnessDesk/HarnessDesk/actions/workflows/ci.yml)
+[![CI](https://github.com/HarnessDesk/dsh-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/HarnessDesk/dsh-acp/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 Drive [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) from any
