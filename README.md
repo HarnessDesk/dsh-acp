@@ -32,6 +32,7 @@ the wire.
 | Plans (`todo_write`) | — | ✅ `plan` |
 | Token usage | — | ✅ `usage_update` + `PromptResponse.usage` |
 | Model / effort / sandbox mode | — | ✅ ACP `configOptions` |
+| Conversation list | — | ✅ `session/list`, with the harness's own titles |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
 
 Token usage follows ACP's [Session Context Size and Cost](https://agentclientprotocol.com/rfds/session-usage)
@@ -147,12 +148,15 @@ and "% cached" means the same thing here as for every other agent.
 ## Status
 
 Working and tested end to end against a real harness: streaming, reasoning, tool
-calls with output, plans, usage, permission prompts, and the three session controls.
+calls with output, plans, usage, permission prompts, the three session controls, and
+a conversation list carrying the harness's own session titles.
 
 Not implemented yet:
 
 - `session/load` — the capability is advertised as `false` rather than being claimed
-  and then failing.
+  and then failing. Because of this, `session/list` reports the conversations this
+  process is holding rather than reading the harness's persisted store, so a
+  conversation does not yet survive a restart.
 - Live `session/set_model` and `session/set_config_option`; the options are reported,
   but changing one mid-session is not wired.
 - MCP server pass-through.

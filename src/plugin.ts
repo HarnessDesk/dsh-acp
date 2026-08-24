@@ -27,7 +27,11 @@ import type { DshEvent } from './types.ts'
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
   readonly agent: HarnessAgent
+  readonly cwd: string
   readonly projection: SessionProjection
+  /** The opening ask, so a listed conversation reads as something. */
+  preview?: string | undefined
+  updatedAt: number
   dispose(): Promise<void> | void
   inflight?: {
     resolve(reason: string): void
@@ -110,6 +114,10 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
           // capability we cannot honour would earn a `session/load` we answer
           // with an error, which is worse for a client than knowing up front.
           loadSession: false,
+          // Listing is answered from this process's live sessions. It is what
+          // gives a client's conversation list a name and a folder instead of
+          // a row reading "Untitled session".
+          sessionCapabilities: { list: {} },
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
         },
         authMethods: [],
@@ -133,7 +141,9 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         })
         sessions.set(sessionId, {
           agent: handle.agent,
+          cwd,
           projection: new SessionProjection(),
+          updatedAt: Date.now(),
           dispose: () => handle.dispose(),
         })
         return { sessionId, configOptions: sessionConfigOptions(config) }
@@ -151,6 +161,8 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
           .join('')
         if (text.trim().length === 0) throw invalidParams('empty prompt')
 
+        record.preview ??= text.trim().slice(0, 200)
+        record.updatedAt = Date.now()
         const message = await createUserMessage(text)
         const stopReason = await new Promise<string>((resolve, reject) => {
           record.inflight = { resolve, reject }
@@ -165,6 +177,24 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         record.projection.endTurn()
         return { stopReason, ...(usage !== undefined ? { usage } : {}) }
       },
+
+      /**
+       * The conversations this process is holding, newest first. Sessions do
+       * not outlive the process yet — `loadSession` is false — so this lists
+       * what is live rather than reading the harness's own store.
+       */
+      listSessions: (params: { cwd?: string } = {}) => Promise.resolve({
+        sessions: [...sessions.entries()]
+          .filter(([, record]) => params.cwd === undefined || record.cwd === params.cwd)
+          .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+          .map(([sessionId, record]) => ({
+            sessionId,
+            cwd: record.cwd,
+            title: record.projection.title ?? null,
+            preview: record.preview ?? null,
+            updatedAt: new Date(record.updatedAt).toISOString(),
+          })),
+      }),
 
       cancel: (params: { sessionId: string }) => {
         const record = sessions.get(params.sessionId)

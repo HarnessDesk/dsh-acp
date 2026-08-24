@@ -277,3 +277,29 @@ describe('the inputTokens convention', () => {
     expect(usage?.totalTokens).toBe(12_677)
   })
 })
+
+describe('session title', () => {
+  it('remembers the name the harness gives a conversation', () => {
+    const projection = new SessionProjection()
+    expect(projection.title).toBeUndefined()
+    // Not projected onto the wire — ACP has no title update — but carried so
+    // `session/list` rows are not all "Untitled session".
+    expect(projection.onEvent({ type: 'session/title', data: { title: '  Add a scoring system  ' } })).toEqual([])
+    expect(projection.title).toBe('Add a scoring system')
+  })
+
+  it('ignores an empty title rather than blanking a good one', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'session/title', data: { title: 'Real name' } })
+    projection.onEvent({ type: 'session/title', data: { title: '   ' } })
+    projection.onEvent({ type: 'session/title', data: {} })
+    expect(projection.title).toBe('Real name')
+  })
+
+  it('takes the title from the recorded session fixtures', () => {
+    const projection = new SessionProjection()
+    for (const event of fixtures) projection.onEvent(event)
+    expect(typeof projection.title).toBe('string')
+    expect(projection.title!.length).toBeGreaterThan(0)
+  })
+})

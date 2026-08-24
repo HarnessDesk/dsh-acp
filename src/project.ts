@@ -140,11 +140,17 @@ export class SessionProjection {
     this.#replay = options.replay ?? false
   }
 
+  #title: string | undefined
   #contextWindow: number | undefined
   #lastContextUse = 0
   #sawUsage = false
   readonly #turn = { input: 0, output: 0, cachedRead: 0, cachedWrite: 0, thought: 0 }
   readonly #toolNames = new Map<string, string>()
+
+  /** The name the harness gave this conversation, once it has named one. */
+  get title(): string | undefined {
+    return this.#title
+  }
 
   /** The context window the current route reports, once `request/context` has landed. */
   get contextWindow(): number | undefined {
@@ -171,6 +177,15 @@ export class SessionProjection {
         return this.#onTodoWrite(data)
       case 'user/message':
         return this.#onUserMessage(data)
+      case 'session/title': {
+        // ACP has no title update, so this is not projected onto the wire.
+        // It is kept because `session/list` rows carry a title, and a client
+        // that lists conversations shows "Untitled session" without one while
+        // the harness knew exactly what it was.
+        const title = asString(data['title'])?.trim()
+        if (title !== undefined && title.length > 0) this.#title = title
+        return []
+      }
       default:
         // Unknown and uninteresting types share this branch on purpose: the
         // harness's vocabulary grows, and an adapter that threw on a new
