@@ -19,7 +19,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext } from './harness.ts'
+import { createUserMessage, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessProjectionContext } from './harness.ts'
 import { SessionProjection } from './project.ts'
 import { sessionConfigOptions, type AdapterConfig } from './options.ts'
 import type { DshEvent } from './types.ts'
@@ -83,6 +83,26 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     for (const update of record.projection.onEvent(event)) notify(sessionId, update)
   }) as (...args: never[]) => void)
 
+  // The harness's own token meter, when the composition mounts one. Its
+  // three projections are the only place a client can learn two things the
+  // event stream does not carry: that a compaction shrank the conversation,
+  // and what the prompt is actually made of.
+  //
+  // `inject` rather than a hard dependency in `inject = [...]`, deliberately:
+  // a composition without `dsh-session-projection` and `dsh-token-meter` must
+  // keep working, and it does — the mapper falls back to the per-request sum
+  // it has always used, and simply sends no breakdown. This is the same
+  // pattern `dsh-token-meter` itself uses to register the units.
+  ctx.inject(['sessionProjections'], ((projectionCtx: HarnessProjectionContext) => {
+    projectionCtx.sessionProjections.onChanged((session, key, value) => {
+      const sessionId = session.header?.id ?? session.id
+      if (sessionId === undefined) return
+      const record = sessions.get(sessionId)
+      if (record === undefined) return
+      for (const update of record.projection.onProjection(key, value)) notify(sessionId, update)
+    })
+  }) as (...args: never[]) => void)
+
   // Permission prompts are a real interaction, not a policy hook: the client
   // shows them to a person and the answer decides one call.
   ctx.on('approval/request', ((request: ApprovalRequest, next: () => unknown) => {
@@ -108,7 +128,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     return {
       initialize: () => Promise.resolve({
         protocolVersion: PROTOCOL_VERSION,
-        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: '0.1.0' },
+        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: '0.2.0' },
         agentCapabilities: {
           // `loadSession` stays false until replay is implemented. Declaring a
           // capability we cannot honour would earn a `session/load` we answer

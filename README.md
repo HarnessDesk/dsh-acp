@@ -31,6 +31,7 @@ the wire.
 | Tool calls | — | ✅ `tool_call` / `tool_call_update`, with output |
 | Plans (`todo_write`) | — | ✅ `plan` |
 | Token usage | — | ✅ `usage_update` + `PromptResponse.usage` |
+| Context composition | — | ✅ system / tools / messages, from the harness's own meter |
 | Model / effort / sandbox mode | — | ✅ ACP `configOptions` |
 | Conversation list | — | ✅ `session/list`, with the harness's own titles |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
@@ -144,6 +145,56 @@ the model ever saw.
 Passing the harness's number through unchanged makes a 12,574-token prompt render as
 157 tokens. The adapter converts, so `cachedReadTokens` stays a share of `inputTokens`
 and "% cached" means the same thing here as for every other agent.
+
+### Context composition
+
+A composition that mounts `@deepseek-ai/dsh-token-meter` and
+`@deepseek-ai/dsh-session-projection` gets two things nothing on the event stream
+can supply.
+
+**Occupancy that survives compaction.** The meter's `contextPressure` projection
+reports what the *next* request would cost — a provider-anchored sample repriced for
+everything the conversation has gained or lost since. Compaction reports no usage of
+its own, so an indicator built from `assistant/chunk` alone stays stale until the next
+request happens to run; this one drops the moment the conversation is compacted. The
+adapter prefers it and falls back to the per-request sum when no meter is mounted.
+
+**What the prompt is made of.** The `contextBreakdown` projection prices the system
+prompt, the tool schemas and the conversation separately, and the adapter carries all
+three on `usage_update._meta.harnessdesk.contextBreakdown`, beside the occupancy they
+explain:
+
+```jsonc
+{
+  "sessionUpdate": "usage_update",
+  "used": 43574, "size": 1000000,
+  "_meta": { "harnessdesk": { "contextBreakdown": {
+    "approximate": true,
+    "source": "DeepSeek Harness token meter",
+    "segments": [
+      { "id": "system",   "label": "System prompt", "tokens": 44 },
+      { "id": "tools",    "label": "Tool schemas",  "tokens": 771, "count": 3 },
+      { "id": "messages", "label": "Messages",      "tokens": 325 }
+    ]
+  } } }
+}
+```
+
+`approximate` is not decoration. The segments come from the meter's fixed density
+estimate while `used` is anchored to what the provider actually charged, so the two
+are in different units of truth and the segments will not sum to `used`. The harness
+says so itself, and this adapter passes the warning along rather than dropping it. No
+total is sent, and none should be inferred by subtraction — render these as shares of
+a composition, never as slices of the ring.
+
+Only `count`, the number of tool schemas in the request envelope, is exact; it is read
+off `request/header`, which the adapter otherwise leaves alone. Pricing that envelope
+here would mean shipping a tokenizer and guessing at DeepSeek's, when the harness
+already prices it with the estimator it prices everything else with.
+
+Everything in this section is optional. `ctx.inject(['sessionProjections'], …)` never
+runs in a composition without the registry, and a client that ignores `_meta` still
+gets the ring.
 
 ## Status
 

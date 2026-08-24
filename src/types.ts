@@ -34,6 +34,53 @@ export interface DshUsage {
   readonly reasoningTokens?: number
 }
 
+/**
+ * DeepSeek Harness's own token-meter projections, declared structurally like
+ * everything else in this module.
+ *
+ * `@deepseek-ai/dsh-token-meter` registers three units with
+ * `ctx.sessionProjections`, and two of them are what a context indicator is
+ * actually made of. They are read rather than recomputed for the same reason
+ * the rest of this adapter reads rather than recomputes: the harness knows
+ * things about its own prompt that no observer of the event stream does —
+ * chiefly that a compaction shrank the conversation, which reports no usage
+ * of its own and so cannot be seen in `assistant/chunk` at all.
+ */
+
+/**
+ * `contextPressure` — occupancy, anchored to provider-reported usage.
+ *
+ * The harness's own doc is explicit that the fields are not one atomic
+ * observation: each is a last-wins record of a different moment, so a model
+ * switch can pair a fresh capacity with the previous route's pressure until
+ * the next request reports usage. That is acceptable for a status display and
+ * would not be for billing; this adapter only ever draws a ring with it.
+ */
+export interface DshContextPressure {
+  /** Provider-reported prompt size of the most recent request; output excluded. */
+  readonly pressureTokens?: number
+  /** That sample, repriced for everything the surface gained or lost since. */
+  readonly projectedTokens?: number
+  /** Newest recorded route capacity. */
+  readonly contextWindow?: number
+}
+
+/**
+ * `contextBreakdown` — what the prompt is *made of*, not what it costs.
+ *
+ * All three figures come from the meter's fixed density estimate, so they do
+ * not sum to the provider-anchored occupancy above and must never be
+ * presented as a total. The harness says so itself, and this adapter passes
+ * that warning along the wire as `approximate` rather than quietly dropping
+ * it — a client that showed these as exact segments of the ring would be
+ * making a claim the harness explicitly declined to make.
+ */
+export interface DshContextBreakdown {
+  readonly systemTokens?: number
+  readonly toolsTokens?: number
+  readonly messageTokens?: number
+}
+
 /** What the model was routed to, from `request/context`. */
 export interface DshRequestContext {
   readonly provider?: string
@@ -85,7 +132,53 @@ export type AcpUpdate =
         readonly priority: 'low' | 'medium' | 'high'
       }[]
     }
-  | { readonly sessionUpdate: 'usage_update'; readonly used: number; readonly size: number }
+  | {
+      readonly sessionUpdate: 'usage_update'
+      readonly used: number
+      readonly size: number
+      readonly _meta?: AcpUpdateMeta
+    }
+
+/**
+ * One named part of the context, for a client that draws a composition rather
+ * than a single bar.
+ */
+export interface AcpContextSegment {
+  readonly id: 'system' | 'tools' | 'messages'
+  readonly label: string
+  readonly tokens: number
+  /** How many things the segment is: the number of tool schemas. Exact. */
+  readonly count?: number
+}
+
+/**
+ * The composition of the context, carried beside the occupancy it explains.
+ *
+ * `approximate` is load-bearing, not decoration. The segments are priced by
+ * the harness's fixed density heuristic while `used` is anchored to what the
+ * provider actually charged, so the two are in different units of truth and
+ * the segments will not sum to `used`. A client renders this as *shares of a
+ * composition*; one that renders it as slices of the ring, or that fills in a
+ * "free space" segment by subtraction, is asserting a total nobody measured.
+ */
+export interface AcpContextBreakdown {
+  readonly segments: readonly AcpContextSegment[]
+  /** True whenever any segment came from an estimator rather than a provider. */
+  readonly approximate: boolean
+  /** Who priced it, so a client can name the source in its own interface. */
+  readonly source: string
+}
+
+/**
+ * ACP's extension slot. Nothing here is required to render a session — a
+ * client that ignores `_meta` entirely still gets the ring, which is the
+ * whole point of putting it here rather than inventing a session update.
+ */
+export interface AcpUpdateMeta {
+  readonly harnessdesk?: {
+    readonly contextBreakdown?: AcpContextBreakdown
+  }
+}
 
 /** The per-turn totals ACP returns on `PromptResponse.usage`. */
 export interface AcpUsage {

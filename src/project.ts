@@ -22,10 +22,14 @@ import {
   asNumber,
   asString,
   isRecord,
+  type AcpContextBreakdown,
+  type AcpContextSegment,
   type AcpPlanStatus,
   type AcpToolKind,
   type AcpUpdate,
   type AcpUsage,
+  type DshContextBreakdown,
+  type DshContextPressure,
   type DshEvent,
 } from './types.ts'
 
@@ -144,6 +148,16 @@ export class SessionProjection {
   #contextWindow: number | undefined
   #lastContextUse = 0
   #sawUsage = false
+  /**
+   * Occupancy as the harness's own token meter reports it, when the
+   * composition mounts one. It supersedes `#lastContextUse` rather than
+   * averaging with it — see `#fill`.
+   */
+  #meteredUse: number | undefined
+  /** The composition of the prompt, from the meter's breakdown projection. */
+  #breakdown: DshContextBreakdown | undefined
+  /** How many tool schemas the newest request envelope carried. Exact. */
+  #toolCount: number | undefined
   readonly #turn = { input: 0, output: 0, cachedRead: 0, cachedWrite: 0, thought: 0 }
   readonly #toolNames = new Map<string, string>()
 
@@ -165,6 +179,8 @@ export class SessionProjection {
   onEvent(event: DshEvent): AcpUpdate[] {
     const data = isRecord(event.data) ? event.data : {}
     switch (event.type) {
+      case 'request/header':
+        return this.#onRequestHeader(data)
       case 'request/context':
         return this.#onRequestContext(data)
       case 'assistant/chunk':
@@ -198,8 +214,120 @@ export class SessionProjection {
     const size = asNumber(data['contextWindow'])
     if (size > 0) this.#contextWindow = size
     // A window that arrives after the first usage completes a fraction we
-    // could not send at the time.
-    return this.#sawUsage ? this.#usageUpdate() : []
+    // could not send at the time. The meter can supply that numerator too, so
+    // the test is the fill itself rather than "did a usage chunk arrive".
+    return this.#fill > 0 ? this.#usageUpdate() : []
+  }
+
+  /**
+   * The assembled request envelope: the system prompt and the tool schemas
+   * the harness is about to send.
+   *
+   * Only the tool *count* is taken from it. The envelope carries the full
+   * text of both, and pricing them here would mean shipping a tokenizer and
+   * guessing at DeepSeek's — while the harness already prices them, with the
+   * same estimator it prices everything else with, and publishes the result
+   * as the `contextBreakdown` projection. A count is different: it is exact,
+   * it needs nothing, and "23 tool schemas" is the part of that row a reader
+   * can act on.
+   */
+  #onRequestHeader(data: Record<string, unknown>): AcpUpdate[] {
+    const header = isRecord(data['header']) ? data['header'] : undefined
+    const tools = header?.['tools']
+    if (!Array.isArray(tools)) return []
+    if (tools.length === this.#toolCount) return []
+    this.#toolCount = tools.length
+    // The count only changes what an existing breakdown row *says*, so it is
+    // worth re-sending only when there is a breakdown to re-send.
+    return this.#breakdown === undefined ? [] : this.#usageUpdate()
+  }
+
+  /**
+   * One value from the harness's session-projection registry.
+   *
+   * Kept here, in the pure mapper, rather than in the plugin: which
+   * projections matter and what they mean for the wire is mapping, and the
+   * plugin's job is only to hand them over. Unknown keys are ignored for the
+   * same reason unknown events are.
+   *
+   * @param key - the projection key, as `SessionProjectionMap` names it.
+   * @param value - the unit's whole current value.
+   * @returns the ACP updates the new value implies.
+   */
+  onProjection(key: string, value: unknown): AcpUpdate[] {
+    if (!isRecord(value)) return []
+    switch (key) {
+      case 'contextPressure':
+        return this.#onPressure(value as DshContextPressure)
+      case 'contextBreakdown':
+        return this.#onBreakdown(value as DshContextBreakdown)
+      default:
+        return []
+    }
+  }
+
+  #onPressure(value: DshContextPressure): AcpUpdate[] {
+    const size = asNumber(value.contextWindow)
+    if (size > 0) this.#contextWindow = size
+    // `projectedTokens` before `pressureTokens`: the first is what the *next*
+    // request would cost, which is the question a context indicator is asked,
+    // and it is the only one of the two that moves when a compaction shadows
+    // a span — compaction reports no usage, so an occupancy built from usage
+    // alone stays stale until the next request happens to run.
+    const used = asNumber(value.projectedTokens) || asNumber(value.pressureTokens)
+    if (used <= 0) return []
+    this.#meteredUse = used
+    return this.#usageUpdate()
+  }
+
+  #onBreakdown(value: DshContextBreakdown): AcpUpdate[] {
+    const next = {
+      systemTokens: asNumber(value.systemTokens),
+      toolsTokens: asNumber(value.toolsTokens),
+      messageTokens: asNumber(value.messageTokens),
+    }
+    if (next.systemTokens + next.toolsTokens + next.messageTokens <= 0) return []
+    this.#breakdown = next
+    return this.#usageUpdate()
+  }
+
+  /**
+   * The composition, as the wire carries it. Empty segments are dropped: a
+   * session before its first request has no tool schemas, and a zero-token
+   * row invites a reader to conclude something was measured at zero.
+   */
+  #contextBreakdown(): AcpContextBreakdown | undefined {
+    const source = this.#breakdown
+    if (source === undefined) return undefined
+    const segments: AcpContextSegment[] = []
+    const push = (id: AcpContextSegment['id'], label: string, tokens: number, count?: number): void => {
+      if (tokens > 0) segments.push({ id, label, tokens, ...(count === undefined ? {} : { count }) })
+    }
+    push('system', 'System prompt', asNumber(source.systemTokens))
+    push('tools', 'Tool schemas', asNumber(source.toolsTokens), this.#toolCount)
+    push('messages', 'Messages', asNumber(source.messageTokens))
+    if (segments.length === 0) return undefined
+    return {
+      segments,
+      // Every segment is the meter's fixed density estimate. Nothing here is
+      // provider-anchored, and the flag says so on every send rather than
+      // being something a client has to know about DeepSeek Harness.
+      approximate: true,
+      source: 'DeepSeek Harness token meter',
+    }
+  }
+
+  /**
+   * Occupancy, from the best source that has spoken.
+   *
+   * The meter wins when it is mounted, because it sees what the event stream
+   * does not: compaction, and the surface as it stands rather than as the
+   * last request found it. Without it — a composition with no `token-meter`
+   * plugin — the per-request sum below is still a true fraction, and a ring
+   * drawn from it is better than no ring.
+   */
+  get #fill(): number {
+    return this.#meteredUse ?? this.#lastContextUse
   }
 
   #onChunk(data: Record<string, unknown>): AcpUpdate[] {
@@ -262,8 +390,15 @@ export class SessionProjection {
 
   #usageUpdate(): AcpUpdate[] {
     const size = this.#contextWindow
-    if (size === undefined || this.#lastContextUse <= 0) return []
-    return [{ sessionUpdate: 'usage_update', used: this.#lastContextUse, size }]
+    const used = this.#fill
+    if (size === undefined || used <= 0) return []
+    const breakdown = this.#contextBreakdown()
+    return [{
+      sessionUpdate: 'usage_update',
+      used,
+      size,
+      ...(breakdown === undefined ? {} : { _meta: { harnessdesk: { contextBreakdown: breakdown } } }),
+    }]
   }
 
   #onToolCall(data: Record<string, unknown>): AcpUpdate[] {
