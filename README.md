@@ -235,7 +235,19 @@ Not implemented yet:
   conversation does not yet survive a restart.
 - Live `session/set_model` and `session/set_config_option`; the options are reported,
   but changing one mid-session is not wired.
-- MCP server pass-through.
+- **MCP server pass-through — refused, out loud.** The harness does host MCP
+  servers, through `@deepseek-ai/dsh-mcp-client`, but it connects them at
+  composition time: one plugin instance per server in `cordis.yml`. Nothing on
+  the ACP wire can add one to a harness that is already composed, and this
+  adapter will not edit somebody's composition on their behalf. So a non-empty
+  `mcpServers` on `session/new` is refused with an error naming the parameter.
+
+  It is worth being explicit about why that is better than the alternative.
+  Until 0.3.0 this adapter accepted the parameter and ignored it, which left
+  the client believing its tools had reached the model. They had not, and the
+  only symptom was an agent that said it could not do something it had been
+  told it could. A refusal naming `mcpServers` is the one answer a client can
+  act on: it retries without the server and reports which tools are missing.
 
 ## Development
 
