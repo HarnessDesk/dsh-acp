@@ -42,6 +42,35 @@ interface Record_ {
 const invalidParams = (detail: string): RequestError =>
   RequestError.invalidParams(undefined, detail)
 
+/**
+ * Refuse an MCP tool server offered on `session/new`, rather than taking it
+ * and dropping it.
+ *
+ * The harness does host MCP servers — `@deepseek-ai/dsh-mcp-client` connects
+ * to one and registers its tools on `ctx.tools` — but it does so at
+ * composition time, one plugin instance per server in `cordis.yml`. Nothing on
+ * the ACP wire can add one to a harness that is already composed, and this
+ * adapter will not write to somebody's composition on their behalf.
+ *
+ * So the honest answer is no, and it has to be said out loud. Accepting the
+ * parameter and ignoring it — which is what this did until now — is worse than
+ * refusing: the client believes its tools reached the model, the model never
+ * sees them, and the only symptom is an agent that says it cannot do something
+ * it was told it could. A refusal naming `mcpServers` is the one thing a
+ * client knows how to handle; it retries without the server and reports why
+ * those tools are missing.
+ */
+export const refuseToolServers = (params: { readonly mcpServers?: unknown }): void => {
+  const servers = params.mcpServers
+  if (!Array.isArray(servers) || servers.length === 0) return
+  throw invalidParams(
+    'mcpServers is not supported: DeepSeek Harness loads MCP servers from its ' +
+      'composition — one `@deepseek-ai/dsh-mcp-client` entry per server in ' +
+      'cordis.yml — and not from a session request, so tools offered this way ' +
+      'would never reach the model. Add the server to the composition instead.',
+  )
+}
+
 const internalError = (detail: string): RequestError =>
   RequestError.internalError(undefined, detail)
 
@@ -128,7 +157,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     return {
       initialize: () => Promise.resolve({
         protocolVersion: PROTOCOL_VERSION,
-        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: '0.2.0' },
+        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: '0.3.0' },
         agentCapabilities: {
           // `loadSession` stays false until replay is implemented. Declaring a
           // capability we cannot honour would earn a `session/load` we answer
@@ -145,8 +174,9 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
 
       authenticate: () => Promise.resolve(),
 
-      newSession: async (params: { cwd?: string }) => {
+      newSession: async (params: { cwd?: string; mcpServers?: unknown }) => {
         if (closed) throw internalError('the adapter has been disposed')
+        refuseToolServers(params)
         const cwd = params.cwd
         if (typeof cwd !== 'string' || cwd.length === 0) {
           throw invalidParams('session/new requires an absolute cwd')

@@ -1,6 +1,6 @@
 {
   "name": "@harnessdesk/dsh-acp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A complete Agent Client Protocol server for DeepSeek Harness — streams reasoning, tool calls, plans, and token usage that the harness's own automation bridge withholds.",
   "keywords": ["acp", "agent-client-protocol", "deepseek", "deepseek-harness", "dsh", "harnessdesk"],
   "license": "MIT",
