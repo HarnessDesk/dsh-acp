@@ -22,7 +22,37 @@ export interface HarnessAgent {
   readonly session: HarnessSession
   followup(message: unknown): void
   whenIdle(): Promise<unknown>
+  /**
+   * Stop the live turn and clear queued work.
+   * `@deepseek-ai/dsh-agent` spells this `cancel(cause, options?)` — the cause
+   * is durable, and `{ kind: 'user' }` is the one a person clicking stop
+   * means. Optional here only because this contract is structural.
+   */
+  cancel?(cause: { readonly kind: 'user' }, options?: { readonly keepInbox?: boolean }): void
+  /** What an older harness tree called the same thing. */
   abort?(): void
+}
+
+/**
+ * Stop whatever the agent is doing, on behalf of the person who asked.
+ *
+ * Written as its own function because the two spellings are the whole
+ * problem: this adapter called `abort()` alone, the live harness has only
+ * `cancel()`, and an optional call to a method that is not there is a silent
+ * no-op — which is exactly what a stop button must never be.
+ *
+ * @returns whether anything was actually asked to stop.
+ */
+export const stopAgent = (agent: Pick<HarnessAgent, 'cancel' | 'abort'>): boolean => {
+  if (typeof agent.cancel === 'function') {
+    agent.cancel({ kind: 'user' })
+    return true
+  }
+  if (typeof agent.abort === 'function') {
+    agent.abort()
+    return true
+  }
+  return false
 }
 
 export interface HarnessAgentHandle {

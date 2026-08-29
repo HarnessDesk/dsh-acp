@@ -19,7 +19,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessProjectionContext } from './harness.ts'
+import { createUserMessage, stopAgent, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessProjectionContext } from './harness.ts'
 import { SessionProjection } from './project.ts'
 import { sessionConfigOptions, type AdapterConfig } from './options.ts'
 import type { DshEvent } from './types.ts'
@@ -37,6 +37,8 @@ interface Record_ {
     resolve(reason: string): void
     reject(error: Error): void
   } | undefined
+  /** Whether the turn in flight was stopped by the person, not by the model. */
+  cancelled?: boolean
 }
 
 const invalidParams = (detail: string): RequestError =>
@@ -213,6 +215,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
 
         record.preview ??= text.trim().slice(0, 200)
         record.updatedAt = Date.now()
+        record.cancelled = false
         const message = await createUserMessage(text)
         const stopReason = await new Promise<string>((resolve, reject) => {
           record.inflight = { resolve, reject }
@@ -220,7 +223,10 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
           void record.agent.whenIdle().then(() => {
             if (record.inflight === undefined) return
             record.inflight = undefined
-            resolve('end_turn')
+            // A stopped turn ends as `cancelled`, which is the answer the
+            // client is waiting on: to it, a stop that reports `end_turn`
+            // is a turn that finished on its own.
+            resolve(record.cancelled === true ? 'cancelled' : 'end_turn')
           })
         })
         const usage = record.projection.promptUsage()
@@ -248,7 +254,15 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
 
       cancel: (params: { sessionId: string }) => {
         const record = sessions.get(params.sessionId)
-        record?.agent.abort?.()
+        if (record === undefined) return Promise.resolve()
+        record.cancelled = true
+        if (!stopAgent(record.agent)) {
+          // Better a line in the log than a stop button that reports success
+          // and leaves the model running.
+          ctx.logger?.warn(
+            'harnessdesk-acp: this harness agent offers neither cancel() nor abort(); the turn was left running',
+          )
+        }
         return Promise.resolve()
       },
     }
