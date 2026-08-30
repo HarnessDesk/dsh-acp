@@ -19,7 +19,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader } from './harness.ts'
+import { createUserMessage, installModelSelection, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
 import { SessionProjection } from './project.ts'
 import { sessionConfigOptions, type AdapterConfig } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.4.1'
+export const VERSION = '0.5.0'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -51,6 +51,13 @@ interface Record_ {
   cancelled?: boolean
   /** Updates a `session/load` produced, held until its response is sent. */
   replayed?: readonly AcpUpdate[] | undefined
+  /** What the client has chosen for this session, by option id. */
+  readonly chosen: Map<string, string>
+  /**
+   * The live route this session's next step will use, when the harness let us
+   * couple one. Mutating `current` is what makes the model picker real.
+   */
+  selection?: ModelSelectionRef | undefined
 }
 
 const invalidParams = (detail: string): RequestError =>
@@ -365,6 +372,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
       cwd,
       projection,
       updatedAt: Date.now(),
+      chosen: new Map(),
       dispose: () => handle.dispose(),
       ...(replayed !== undefined ? { replayed } : {}),
     }
@@ -422,21 +430,38 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
           throw invalidParams('session/new requires an absolute cwd')
         }
         const sessionId = randomUUID()
+        // The selection the picker mutates. Installed during setup, which is
+        // the only point at which the harness will accept it — everything
+        // registered there exists before the first prompt assembly.
+        const selection: ModelSelectionRef = {
+          current:
+            config.provider !== undefined && config.model !== undefined
+              ? { provider: config.provider, model: config.model }
+              : undefined,
+          assembled: undefined,
+        }
+        let coupled = false
         const handle = await agents.create({
           sessionId,
           meta: { cwd },
+          setup: async (agentCtx) => {
+            coupled = await installModelSelection(agentCtx, selection)
+          },
           ...(config.provider !== undefined || config.model !== undefined
             ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
             : {}),
         })
-        sessions.set(sessionId, {
+        const record: Record_ = {
           agent: handle.agent,
           cwd,
           projection: new SessionProjection(),
           updatedAt: Date.now(),
+          chosen: new Map(),
+          ...(coupled ? { selection } : {}),
           dispose: () => handle.dispose(),
-        })
-        return { sessionId, configOptions: sessionConfigOptions(config) }
+        }
+        sessions.set(sessionId, record)
+        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen) }
       },
 
       prompt: async (params: { sessionId: string; prompt: readonly unknown[] }) => {
@@ -496,7 +521,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         // client folds these into history rather than drawing them as news.
         for (const update of record.replayed ?? []) notify(sessionId, update)
         record.replayed = undefined
-        return { configOptions: sessionConfigOptions(config) }
+        return { configOptions: sessionConfigOptions(config, record.chosen) }
       },
 
       /**
@@ -507,8 +532,8 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
        */
       resumeSession: async (params: { sessionId?: string; cwd?: string; mcpServers?: unknown }) => {
         refuseToolServers(params)
-        const { sessionId } = await reopen(params, { replay: false })
-        return { sessionId, configOptions: sessionConfigOptions(config) }
+        const { record, sessionId } = await reopen(params, { replay: false })
+        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen) }
       },
 
       /**
@@ -587,6 +612,71 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
             .sort((a, b) => b.sortAt - a.sortAt)
             .map(({ sortAt: _sortAt, ...row }) => row),
         }
+      },
+
+      /**
+       * Apply one of the controls `session/new` advertised.
+       *
+       * Advertising a control and not serving this method is worse than
+       * advertising nothing: the client draws a working picker, the person
+       * chooses, and the answer is `Method not found`. That is exactly how
+       * this behaved until now.
+       *
+       * Only `mode` reaches the harness today. `model` and `effort` are
+       * remembered and returned so the picker keeps the person's choice, but
+       * the running agent's route is fixed at composition time — saying so in
+       * the response is the honest half of a control this adapter cannot yet
+       * honour, and it is tracked rather than silently dropped.
+       */
+      setSessionConfigOption: async (params: {
+        sessionId?: string
+        configId?: string
+        optionId?: string
+        value?: string
+      }) => {
+        const record = require_(params.sessionId ?? '')
+        // ACP's field is `configId` (SessionConfigId). `optionId` is accepted
+        // as well because it is the name the option itself carries, and a
+        // client that sends the obvious one should not get "unknown option".
+        const optionId = params.configId ?? params.optionId ?? ''
+        const value = params.value ?? ''
+        const option = sessionConfigOptions(config).find((entry) => entry.id === optionId)
+        if (option === undefined) throw invalidParams(`unknown option ${JSON.stringify(optionId)}`)
+        if (!option.options.some((choice) => choice.value === value)) {
+          throw invalidParams(`${optionId} has no choice ${JSON.stringify(value)}`)
+        }
+        if (optionId === 'mode') {
+          const applied = await setSandboxMode(record.agent.session, value)
+          if (!applied) {
+            throw internalError(
+              'this harness composition has no sandbox policy, so its permission mode cannot be changed from here',
+            )
+          }
+        } else if (record.selection === undefined) {
+          // Refused rather than remembered. A picker that keeps a choice the
+          // agent never adopts is a lie the person cannot see through — this
+          // adapter showed "Flash" over an agent answering "I am v4 Pro".
+          throw internalError(
+            `this harness composition fixes the route at startup, so ${optionId} cannot be changed for a running conversation`,
+          )
+        } else {
+          const provider = record.selection.current?.provider ?? config.provider
+          const model = optionId === 'model' ? value : record.selection.current?.model ?? config.model
+          if (provider === undefined || model === undefined) {
+            throw internalError('this conversation has no provider/model route to change')
+          }
+          const effort = optionId === 'effort' ? value : record.selection.current?.reasoningEffort
+          // Prompt assembly reads this before the next step, so the switch
+          // lands on the next step rather than splitting a step in half.
+          record.selection.current = {
+            provider,
+            model,
+            ...(effort !== undefined && effort !== 'off' ? { reasoningEffort: effort } : {}),
+          }
+        }
+        record.chosen.set(optionId, value)
+        record.updatedAt = Date.now()
+        return { configOptions: sessionConfigOptions(config, record.chosen) }
       },
 
       cancel: (params: { sessionId: string }) => {

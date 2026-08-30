@@ -56,13 +56,22 @@ export interface ConfigOption {
  * The options a `session/new` response should carry. A control with fewer
  * than two choices is omitted: offering a picker with one entry is noise.
  */
-export const sessionConfigOptions = (config: AdapterConfig): ConfigOption[] => {
+export const sessionConfigOptions = (
+  config: AdapterConfig,
+  /**
+   * What the client has already chosen for this session, by option id.
+   *
+   * A picker that forgets the choice the moment it is made reads as a control
+   * that did nothing, which is indistinguishable from one that is broken.
+   */
+  chosen: ReadonlyMap<string, string> = new Map(),
+): ConfigOption[] => {
   const out: ConfigOption[] = []
   const models = config.models ?? []
   if (models.length >= 2) {
     out.push({
       type: 'select', id: 'model', name: 'Model', category: 'model',
-      currentValue: config.model ?? models[0]!,
+      currentValue: chosen.get('model') ?? config.model ?? models[0]!,
       options: models.map((value) => ({ value, name: label(value) })),
     })
   }
@@ -70,13 +79,13 @@ export const sessionConfigOptions = (config: AdapterConfig): ConfigOption[] => {
   if (efforts.length >= 2) {
     out.push({
       type: 'select', id: 'effort', name: 'Reasoning', category: 'thought_level',
-      currentValue: efforts.includes('high') ? 'high' : efforts[0]!,
+      currentValue: chosen.get('effort') ?? (efforts.includes('high') ? 'high' : efforts[0]!),
       options: efforts.map((value) => ({ value, name: label(value) })),
     })
   }
   out.push({
     type: 'select', id: 'mode', name: 'Permissions', category: 'mode',
-    currentValue: 'workspace-write',
+    currentValue: chosen.get('mode') ?? 'workspace-write',
     options: MODES.map((value) => ({ value, name: label(value) })),
   })
   return out

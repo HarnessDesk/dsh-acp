@@ -12,6 +12,8 @@
 
 import { randomUUID } from 'node:crypto'
 
+import { harnessModule, resolutionFailures } from './resolve.ts'
+
 /** A harness session, as much of it as we touch. */
 export interface HarnessSession {
   readonly id: string
@@ -67,6 +69,12 @@ export interface HarnessAgents {
     sessionId: string
     meta?: Record<string, unknown>
     agentOptions?: Record<string, unknown>
+    /**
+     * Composition of the agent's scoped world, awaited before the agent is
+     * published. The only safe place to install a model selection: everything
+     * registered here exists before the first prompt assembly.
+     */
+    setup?: (agentCtx: unknown) => Promise<void> | void
   }): Promise<HarnessAgentHandle>
   /**
    * Put an agent back on a session the store already holds.
@@ -80,6 +88,7 @@ export interface HarnessAgents {
     resumeSessionId: string
     meta?: Record<string, unknown>
     agentOptions?: Record<string, unknown>
+    setup?: (agentCtx: unknown) => Promise<void> | void
   }): Promise<HarnessAgentHandle>
   get?(id: string): HarnessAgent | undefined
 }
@@ -229,30 +238,77 @@ export let userMessageFallbackReason: string | undefined
  * is the plain UUID.
  */
 export const createUserMessage = async (text: string): Promise<unknown> => {
-  try {
-    // The specifier is built at runtime so the compiler does not try to
-    // resolve an optional peer that is only present inside a live harness.
-    const specifier = ['@deepseek-ai', 'dsh-llm'].join('/')
-    const llm = (await import(specifier)) as {
-      createUserMessage?: (input: unknown) => unknown
-    }
-    if (typeof llm.createUserMessage === 'function') {
-      return llm.createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'user' },
-      })
-    }
-    userMessageFallbackReason ??= `@deepseek-ai/dsh-llm resolved but exports no createUserMessage`
-  } catch (error) {
-    // Recorded rather than swallowed. A host without the package is a test
-    // double and perfectly fine — but so is a live harness whose package this
-    // resolver cannot see, and those two looked identical until now.
-    userMessageFallbackReason ??= error instanceof Error ? error.message : String(error)
+  const llm = await harnessModule<{ createUserMessage?: (input: unknown) => unknown }>(
+    ['@deepseek-ai', 'dsh-llm'].join('/'),
+  )
+  if (typeof llm?.createUserMessage === 'function') {
+    return llm.createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    })
   }
+  userMessageFallbackReason ??=
+    resolutionFailures.get('@deepseek-ai/dsh-llm') ?? 'resolved but exports no createUserMessage'
   return {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'user' },
   }
+}
+
+
+/**
+ * Switch a session's sandbox mode.
+ *
+ * `setSandboxMode(session, mode)` is a free function on
+ * `@deepseek-ai/dsh-sandbox-policy`, not a method on a service, so it has to
+ * be resolved rather than read off the context. The harness applies it to
+ * "the session's next confined call (bash or fs) — the consumers fold on
+ * every read", so the switch lands on the next tool call rather than
+ * retroactively.
+ *
+ * Returns false when this composition has no sandbox policy, which is a real
+ * composition and not an error — the caller says so instead of pretending the
+ * change took.
+ */
+export const setSandboxMode = async (session: HarnessSession, mode: string): Promise<boolean> => {
+  const policy = await harnessModule<{
+    setSandboxMode?: (session: HarnessSession, mode: string) => void
+  }>(['@deepseek-ai', 'dsh-sandbox-policy'].join('/'))
+  if (typeof policy?.setSandboxMode !== 'function') return false
+  policy.setSandboxMode(session, mode)
+  return true
+}
+
+
+/** The selection `installModelSelection` reads before every prompt assembly. */
+export interface ModelSelectionRef {
+  current: { provider: string; model: string; reasoningEffort?: string } | undefined
+  assembled: { provider: string; model: string; reasoningEffort?: string } | undefined
+}
+
+/**
+ * Couple a mutable model selection to one agent's prompt assembly.
+ *
+ * `installModelSelection(agentCtx, ref)` is how the harness lets a caller
+ * change the route of a *running* agent: prompt assembly reads `ref.current`
+ * before each step, so a switch "takes effect on a later step instead of
+ * splitting the two surfaces". Without it a model picker can only remember a
+ * choice, which is how this adapter came to show "Flash" over an agent that
+ * answered "I am the DeepSeek v4 Pro model".
+ *
+ * Returns false when the harness offers no such coupling; the caller then
+ * declines to advertise a control it cannot honour.
+ */
+export const installModelSelection = async (
+  agentCtx: unknown,
+  selection: ModelSelectionRef,
+): Promise<boolean> => {
+  const agent = await harnessModule<{
+    installModelSelection?: (ctx: unknown, ref: ModelSelectionRef) => unknown
+  }>(['@deepseek-ai', 'dsh-agent'].join('/'))
+  if (typeof agent?.installModelSelection !== 'function') return false
+  agent.installModelSelection(agentCtx, selection)
+  return true
 }
