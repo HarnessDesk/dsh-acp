@@ -204,9 +204,27 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     persistence: HarnessPersistence,
     sessionId: string,
   ): Promise<{ readonly meta: HarnessSessionHeader; readonly events: readonly unknown[] }> => {
-    if (typeof persistence.readFrom === 'function') return persistence.readFrom(sessionId, 0)
-    if (typeof persistence.load === 'function') return persistence.load(sessionId)
-    throw internalError('this session store offers no way to read a stored conversation')
+    const read = typeof persistence.readFrom === 'function'
+      ? () => persistence.readFrom!(sessionId, 0)
+      : typeof persistence.load === 'function'
+        ? () => persistence.load!(sessionId)
+        : undefined
+    if (read === undefined) {
+      throw internalError('this session store offers no way to read a stored conversation')
+    }
+    try {
+      return await read()
+    } catch (error) {
+      // The harness's own validator refuses a log its current format cannot
+      // account for, and says so in its own words — "session event at seq 4
+      // lacks an identified message" is true and unreadable. A person opening
+      // a conversation needs to know it is the *recording* that is too old,
+      // not their click, and that nothing they can do here will fix it.
+      const detail = error instanceof Error ? error.message : String(error)
+      throw internalError(
+        `this conversation was recorded by a different version of DeepSeek Harness and cannot be read back by this one (${detail})`,
+      )
+    }
   }
 
   /** Whether this composition can put an agent back on a stored session. */
