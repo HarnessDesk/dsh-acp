@@ -10,6 +10,8 @@
  * @module
  */
 
+import { randomUUID } from 'node:crypto'
+
 /** A harness session, as much of it as we touch. */
 export interface HarnessSession {
   readonly id: string
@@ -155,6 +157,17 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled'
  */
 export interface HarnessContext {
   readonly agents: HarnessAgents
+  /**
+   * The session service, reached through `inject(['sessions'], …)` rather
+   * than read off this context — cordis refuses an undeclared service read.
+   *
+   * One method matters: **`flush` is what puts a conversation on disk.**
+   * Disposing an agent handle ends the agent; it does not drain the
+   * write-behind buffer. Without it a session's log keeps only the header the
+   * store wrote at creation, so the conversation is listed and cannot be
+   * opened — which is precisely how this behaved before.
+   */
+  readonly __sessionsDoc?: never
   readonly logger?: { warn(message: string): void; info?(message: string): void }
   on(event: string, listener: (...args: never[]) => unknown): unknown
   inject(services: readonly string[], apply: (...args: never[]) => unknown): unknown
@@ -185,6 +198,36 @@ export interface HarnessProjectionContext {
  * to the documented literal only if the import is unavailable — which in a
  * real composition it never is.
  */
+/**
+ * Whether the harness's own factory could not be reached. Reported once, by
+ * the plugin, because a silent fall-through is what hid this for so long.
+ */
+export let userMessageFallbackReason: string | undefined
+
+/**
+ * One user message, in the shape the harness's durable log demands.
+ *
+ * **The `id` is not optional and its absence is silent.** The harness
+ * validates every `user/message`, `assistant/message` and `tool/result` in a
+ * session log with `assertMessageEventShape`, which requires a non-empty
+ * string `id`, a matching `role`, a `source.kind` and an array `content`. An
+ * event that fails it throws `"session event at seq N lacks an identified
+ * message"` — and that throw does not surface when the message is written. It
+ * surfaces later, when something tries to *read the log back*, by which time
+ * the conversation is unreadable and unresumable.
+ *
+ * This adapter minted the fallback without an id, and the dynamic `import()`
+ * that would have used the harness's own factory never resolved — ESM
+ * `import()` does not consult `NODE_PATH`, which is exactly how the harness's
+ * packages are put on the path for a plugin like this one. So the fallback was
+ * not a fallback at all: it was the only path, and every conversation this
+ * adapter ever created was rejected by the harness's own validator.
+ *
+ * The fallback now mints the same id the harness does —
+ * `id: MessageId(crypto.randomUUID())` in `@deepseek-ai/dsh-llm`'s
+ * `createMessage`, where `MessageId` is a branded-type identity and the value
+ * is the plain UUID.
+ */
 export const createUserMessage = async (text: string): Promise<unknown> => {
   try {
     // The specifier is built at runtime so the compiler does not try to
@@ -199,10 +242,15 @@ export const createUserMessage = async (text: string): Promise<unknown> => {
         source: { kind: 'user' },
       })
     }
-  } catch {
-    // Fall through: a host without the package is a test double, not a rig.
+    userMessageFallbackReason ??= `@deepseek-ai/dsh-llm resolved but exports no createUserMessage`
+  } catch (error) {
+    // Recorded rather than swallowed. A host without the package is a test
+    // double and perfectly fine — but so is a live harness whose package this
+    // resolver cannot see, and those two looked identical until now.
+    userMessageFallbackReason ??= error instanceof Error ? error.message : String(error)
   }
   return {
+    id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'user' },

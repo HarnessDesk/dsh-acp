@@ -38,6 +38,22 @@ the wire.
 | …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
 
+### A note for anyone upgrading from 0.4.0 or earlier
+
+Conversations recorded before **0.4.1** cannot be reopened, and it is this
+adapter's fault. The harness validates every message event when a log is read
+back — `assertMessageEventShape` requires a non-empty string `id` — and this
+adapter minted user messages without one. Nothing complains when the message is
+written; the failure appears only when something tries to read the conversation
+back, reported as `session event at seq N lacks an identified message`.
+
+The dynamic `import()` meant to borrow the harness's own message factory never
+resolved either, because ESM `import()` does not consult `NODE_PATH` — which is
+exactly how a plugin like this one is given the harness's packages. So the
+fallback was never a fallback; it was the only path. Fixed in 0.4.1, which
+mints the same `crypto.randomUUID()` id the harness does, and now says out loud
+when it is using its own factory.
+
 ### Reopening a conversation
 
 ACP separates two verbs that sound alike, and the difference decides whether a

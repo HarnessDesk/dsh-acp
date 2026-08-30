@@ -19,7 +19,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, stopAgent, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSessionHeader } from './harness.ts'
+import { createUserMessage, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader } from './harness.ts'
 import { SessionProjection } from './project.ts'
 import { sessionConfigOptions, type AdapterConfig } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.4.0'
+export const VERSION = '0.4.1'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -128,6 +128,18 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
   ctx.inject(['sessionPersistence'], ((storeCtx: HarnessPersistenceContext) => {
     store = storeCtx.sessionPersistence
   }) as (...args: never[]) => void)
+  /**
+   * The session service, held for one method: `flush`.
+   *
+   * Reached through `inject` and not off `ctx` directly — cordis refuses a
+   * service read that was never declared ("cannot get property \"sessions\"
+   * without inject"), and this adapter must keep working in a composition
+   * that has no session service at all.
+   */
+  let sessionService: { flush?(session: HarnessSession): Promise<void> | void } | undefined
+  ctx.inject(['sessions'], ((sessionsCtx: { sessions: { flush?(session: HarnessSession): Promise<void> | void } }) => {
+    sessionService = sessionsCtx.sessions
+  }) as (...args: never[]) => void)
 
   const require_ = (sessionId: string): Record_ => {
     const record = sessions.get(sessionId)
@@ -193,6 +205,48 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
   }) as (...args: never[]) => unknown)
 
   /**
+   * A stored conversation's title and opening ask, folded from its own log.
+   *
+   * The harness keeps the title as `session/title` events *inside* the log, and
+   * `sessionTitle.get()` wants a live `Session` — so a conversation nobody has
+   * opened has no cheap title anywhere. Without this the sidebar reads
+   * "Untitled session" for a conversation whose header, once opened, names
+   * itself; the pane and the list disagreed about the same conversation.
+   *
+   * Bounded and cached, because folding a log is not free: only the newest
+   * `TITLED_ROWS` rows are read, and a title is remembered for the process's
+   * lifetime. Everything else lists without one, which is the honest result of
+   * a bounded read rather than a wrong title.
+   */
+  const titleCache = new Map<string, { title: string | null; preview: string | null }>()
+  const TITLED_ROWS = 40
+  const describeStored = async (
+    persistence: HarnessPersistence,
+    sessionId: string,
+  ): Promise<{ title: string | null; preview: string | null }> => {
+    const known = titleCache.get(sessionId)
+    if (known !== undefined) return known
+    const found: { title: string | null; preview: string | null } = { title: null, preview: null }
+    try {
+      const stored = await readStored(persistence, sessionId)
+      const projection = new SessionProjection({ replay: true })
+      for (const event of stored.events) {
+        try {
+          projection.onEvent(event as DshEvent)
+        } catch {
+          continue
+        }
+      }
+      found.title = projection.title ?? null
+      found.preview = projection.preview ?? null
+    } catch {
+      // A log this harness refuses is still a row; it simply has no name.
+    }
+    titleCache.set(sessionId, found)
+    return found
+  }
+
+  /**
    * One stored conversation's log, read the way a read model should read it.
    *
    * `readFrom(id, 0)` over `load(id)` deliberately — see `HarnessPersistence`.
@@ -215,15 +269,38 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     try {
       return await read()
     } catch (error) {
-      // The harness's own validator refuses a log its current format cannot
-      // account for, and says so in its own words — "session event at seq 4
-      // lacks an identified message" is true and unreadable. A person opening
-      // a conversation needs to know it is the *recording* that is too old,
-      // not their click, and that nothing they can do here will fix it.
+      // The harness validates every message event when a log is read back,
+      // and reports a failure in its own words: "session event at seq 4 lacks
+      // an identified message". That sentence once led this adapter to blame
+      // the recording's age. It was not age — it was this adapter writing
+      // user messages with no `id`, so *every* conversation it created was
+      // unreadable. See `createUserMessage`.
+      //
+      // A conversation written before that fix stays unreadable, and saying
+      // so plainly is the only useful thing left to say about it.
       const detail = error instanceof Error ? error.message : String(error)
       throw internalError(
-        `this conversation was recorded by a different version of DeepSeek Harness and cannot be read back by this one (${detail})`,
+        `this conversation cannot be read back: the harness refused its stored log (${detail}). Conversations recorded before dsh-acp 0.4.1 are affected and cannot be recovered.`,
       )
+    }
+  }
+
+  /**
+   * Drain this session's write-behind buffer to the store.
+   *
+   * Disposing the agent handle does not do it. Until this call was here, a
+   * conversation's log held only the header written at creation: the store
+   * listed it, and opening it found nothing to replay. Failure is logged
+   * rather than thrown — a conversation that will not flush is still a
+   * conversation the person should be allowed to close.
+   */
+  const flushSession = async (record: Record_): Promise<void> => {
+    const flush = sessionService?.flush
+    if (typeof flush !== 'function') return
+    try {
+      await flush.call(sessionService, record.agent.session)
+    } catch (error) {
+      ctx.logger?.warn(`harnessdesk-acp: could not flush the session log: ${String(error)}`)
     }
   }
 
@@ -296,6 +373,17 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
   }
 
   const agent = (connection: AgentSideConnection) => {
+    // Said once, out loud. When this adapter cannot reach the harness's own
+    // message factory it mints the message itself, which is fine — but it was
+    // invisible for long enough to hide a bug that made every conversation
+    // unreadable, so it is never invisible again.
+    void createUserMessage('').then(() => {
+      if (userMessageFallbackReason !== undefined) {
+        ctx.logger?.info?.(
+          `harnessdesk-acp: using the built-in user-message factory (${userMessageFallbackReason})`,
+        )
+      }
+    })
     conn = connection
     return {
       initialize: () => Promise.resolve({
@@ -432,6 +520,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         if (record === undefined) return {}
         if (record.inflight !== undefined) stopAgent(record.agent)
         sessions.delete(params.sessionId as string)
+        await flushSession(record)
         await record.dispose()
         return {}
       },
@@ -462,15 +551,21 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
             // list; the client gets what this process knows.
             ctx.logger?.warn(`harnessdesk-acp: could not read the session store: ${String(error)}`)
           }
-          for (const header of headers) {
-            if (!isRootConversation(header)) continue
-            if (params.cwd !== undefined && header.cwd !== params.cwd) continue
+          const stored = headers
+            .filter((header) => isRootConversation(header))
+            .filter((header) => params.cwd === undefined || header.cwd === params.cwd)
+            .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+          const named = await Promise.all(
+            stored.slice(0, TITLED_ROWS).map((header) => describeStored(store!, header.id)),
+          )
+          for (const [index, header] of stored.entries()) {
             const at = header.createdAt ?? 0
+            const describe = named[index] ?? { title: null, preview: null }
             rows.set(header.id, {
               sessionId: header.id,
               cwd: header.cwd as string,
-              title: null,
-              preview: null,
+              title: describe.title,
+              preview: describe.preview,
               updatedAt: new Date(at).toISOString(),
               sortAt: at,
             })
@@ -519,7 +614,11 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
 
   ctx.on('dispose', (() => {
     closed = true
-    for (const record of sessions.values()) void record.dispose()
+    // Flush before disposing: quitting the app is the commonest way a
+    // conversation ends, and it must not be the way one is lost.
+    for (const record of sessions.values()) {
+      void Promise.resolve(flushSession(record)).then(() => record.dispose())
+    }
     sessions.clear()
   }) as (...args: never[]) => void)
 }

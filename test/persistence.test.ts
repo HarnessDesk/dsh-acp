@@ -132,3 +132,40 @@ describe('the reported version', () => {
     expect(VERSION).toBe(pkg.version)
   })
 })
+
+describe('the user message this adapter mints', () => {
+  it('carries an id, because a log without one can never be read back', async () => {
+    // The harness validates every message event when a log is read:
+    // `assertMessageEventShape` wants a non-empty string `id`, a matching
+    // `role`, a `source.kind`, and array `content`. Nothing complains when
+    // the message is *written* — the failure surfaces only when something
+    // reads the conversation back, by which time it is unrecoverable.
+    //
+    // This adapter shipped without the id and the dynamic import that would
+    // have used the harness's own factory never resolved (ESM `import()`
+    // ignores NODE_PATH, which is how a plugin gets the harness on its path),
+    // so every conversation it ever created was rejected.
+    const { createUserMessage } = await import('../src/harness.ts')
+    const message = (await createUserMessage('hello')) as Record<string, unknown>
+    expect(typeof message['id']).toBe('string')
+    expect(message['id']).not.toBe('')
+    expect(message['role']).toBe('user')
+    expect((message['source'] as { kind?: string }).kind).toBe('user')
+    expect(Array.isArray(message['content'])).toBe(true)
+  })
+
+  it('mints a fresh id per message, never a constant', async () => {
+    const { createUserMessage } = await import('../src/harness.ts')
+    const a = (await createUserMessage('one')) as { id?: string }
+    const b = (await createUserMessage('two')) as { id?: string }
+    expect(a.id).not.toBe(b.id)
+  })
+
+  it('records why it fell back, rather than swallowing the reason', async () => {
+    // The silent `catch {}` is what let a hard resolution failure look
+    // identical to a test double for as long as it did.
+    const mod = await import('../src/harness.ts')
+    await mod.createUserMessage('x')
+    expect(typeof mod.userMessageFallbackReason).toBe('string')
+  })
+})
