@@ -1,23 +1,49 @@
 {
   "name": "@harnessdesk/dsh-acp",
-  "version": "0.3.0",
-  "description": "A complete Agent Client Protocol server for DeepSeek Harness — streams reasoning, tool calls, plans, and token usage that the harness's own automation bridge withholds.",
-  "keywords": ["acp", "agent-client-protocol", "deepseek", "deepseek-harness", "dsh", "harnessdesk"],
+  "version": "0.4.0",
+  "description": "A complete Agent Client Protocol server for DeepSeek Harness \u2014 streams reasoning, tool calls, plans, and token usage that the harness's own automation bridge withholds.",
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "harnessdesk"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/HarnessDesk/dsh-acp.git" },
-  "bugs": { "url": "https://github.com/HarnessDesk/dsh-acp/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HarnessDesk/dsh-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HarnessDesk/dsh-acp/issues"
+  },
   "homepage": "https://github.com/HarnessDesk/dsh-acp#readme",
   "type": "module",
-  "engines": { "node": ">=22.15" },
+  "engines": {
+    "node": ">=22.15"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": { "harnessdesk-dsh-acp": "./dist/bin.js" },
+  "bin": {
+    "harnessdesk-dsh-acp": "./dist/bin.js"
+  },
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./plugin": { "types": "./dist/plugin.d.ts", "default": "./dist/plugin.js" },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
+    },
     "./package.json": "./package.json"
   },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
@@ -32,7 +58,9 @@
     "@deepseek-ai/cordis": "*"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

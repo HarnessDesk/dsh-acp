@@ -66,7 +66,73 @@ export interface HarnessAgents {
     meta?: Record<string, unknown>
     agentOptions?: Record<string, unknown>
   }): Promise<HarnessAgentHandle>
+  /**
+   * Put an agent back on a session the store already holds.
+   *
+   * Optional in the type because a composition without a persistence backend
+   * has no session to resume — the adapter checks for the method rather than
+   * assuming it, and declares the capability only where both this and the
+   * store are present.
+   */
+  resume?(options: {
+    resumeSessionId: string
+    meta?: Record<string, unknown>
+    agentOptions?: Record<string, unknown>
+  }): Promise<HarnessAgentHandle>
   get?(id: string): HarnessAgent | undefined
+}
+
+/**
+ * The durable session log, as `@deepseek-ai/dsh-session-persistence` exposes
+ * it on `ctx.sessionPersistence`.
+ *
+ * Two calls are all this adapter needs, and both are read-only. `list` gives
+ * the conversations that exist; `load` gives one conversation's whole event
+ * log — the *same* `SessionEvent` shape the live feed carries, which is what
+ * makes replay a fold over `SessionProjection` rather than a second mapper.
+ *
+ * Typed structurally like everything else here: the harness's packages sit on
+ * independent version lines and nothing is imported from them.
+ */
+export interface HarnessPersistence {
+  list(signal?: AbortSignal): Promise<readonly HarnessSessionHeader[]>
+  /**
+   * The read-model primitive: the stored events from a sequence onward.
+   *
+   * This is the call replay wants, and `load` is not. The harness documents
+   * `readFrom` as "a detached physical suffix read: no preparation cache,
+   * torn-tail truncation, synthetic closers, or coordinator-state
+   * publication… only events from the valid contiguous stored prefix are
+   * returned". `load` prepares a session for *ownership* — it commits cold
+   * recovery and rejects a log whose committed prefix does not validate.
+   *
+   * Measured on this machine: `load` refused **every** stored session with
+   * "session event at seq N lacks an identified message", while `readFrom`
+   * reads them. Replaying a conversation is reading, not claiming, and using
+   * the ownership call for it makes old logs unopenable for no reason.
+   */
+  readFrom?(id: string, fromSeq: number, signal?: AbortSignal): Promise<{
+    readonly meta: HarnessSessionHeader
+    readonly events: readonly unknown[]
+  }>
+  /** The ownership path, kept only as a fallback where `readFrom` is absent. */
+  load?(id: string): Promise<{ readonly meta: HarnessSessionHeader; readonly events: readonly unknown[] }>
+}
+
+/** What the store knows about a conversation without opening it. */
+export interface HarnessSessionHeader {
+  readonly id: string
+  readonly createdAt?: number
+  readonly cwd?: string
+  /** Set on a forked session; a fork is not a root conversation. */
+  readonly parentSession?: string
+  /** `subagent` for a delegated child, which is not a conversation of its own. */
+  readonly origin?: string
+}
+
+/** The context inside `inject(['sessionPersistence'], …)`. */
+export interface HarnessPersistenceContext {
+  readonly sessionPersistence: HarnessPersistence
 }
 
 /** One approval the harness is asking a client to decide. */

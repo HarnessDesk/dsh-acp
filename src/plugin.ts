@@ -19,10 +19,20 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, stopAgent, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessProjectionContext } from './harness.ts'
+import { createUserMessage, stopAgent, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSessionHeader } from './harness.ts'
 import { SessionProjection } from './project.ts'
 import { sessionConfigOptions, type AdapterConfig } from './options.ts'
-import type { DshEvent } from './types.ts'
+import type { AcpUpdate, DshEvent } from './types.ts'
+
+/**
+ * This adapter's version, as `initialize` reports it.
+ *
+ * Kept beside the code rather than read from `package.json` at runtime — the
+ * published `files` list carries `dist` only, so a runtime read resolves
+ * differently once installed. A test pins it to `package.json`, which is what
+ * makes a hand-edited constant safe.
+ */
+export const VERSION = '0.4.0'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -39,10 +49,26 @@ interface Record_ {
   } | undefined
   /** Whether the turn in flight was stopped by the person, not by the model. */
   cancelled?: boolean
+  /** Updates a `session/load` produced, held until its response is sent. */
+  replayed?: readonly AcpUpdate[] | undefined
 }
 
 const invalidParams = (detail: string): RequestError =>
   RequestError.invalidParams(undefined, detail)
+
+/**
+ * Whether a stored header is a conversation someone can reopen.
+ *
+ * A fork carries a parent and a delegated child is `subagent`; neither is a
+ * root conversation, and listing them puts rows in a client's sidebar that
+ * nobody started. A header with no `cwd` cannot be resumed at all, because
+ * resuming composes an agent in a workspace.
+ */
+export const isRootConversation = (header: HarnessSessionHeader): boolean =>
+  header.parentSession === undefined
+  && header.origin !== 'subagent'
+  && typeof header.cwd === 'string'
+  && header.cwd.length > 0
 
 /**
  * Refuse an MCP tool server offered on `session/new`, rather than taking it
@@ -90,6 +116,18 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
   const sessions = new Map<string, Record_>()
   let conn: AgentSideConnection | undefined
   let closed = false
+  /**
+   * The durable store, when this composition has one.
+   *
+   * `inject` rather than a hard dependency, for the same reason the
+   * projections feed is optional: a composition with no persistence backend
+   * must keep working, and it does — it simply lists only what is live and
+   * declares neither `resume` nor `loadSession`.
+   */
+  let store: HarnessPersistence | undefined
+  ctx.inject(['sessionPersistence'], ((storeCtx: HarnessPersistenceContext) => {
+    store = storeCtx.sessionPersistence
+  }) as (...args: never[]) => void)
 
   const require_ = (sessionId: string): Record_ => {
     const record = sessions.get(sessionId)
@@ -154,21 +192,115 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     })
   }) as (...args: never[]) => unknown)
 
+  /**
+   * One stored conversation's log, read the way a read model should read it.
+   *
+   * `readFrom(id, 0)` over `load(id)` deliberately — see `HarnessPersistence`.
+   * `load` is the ownership path and rejects a log whose committed prefix does
+   * not validate, which on this machine was every log written before the
+   * harness carried message ids.
+   */
+  const readStored = async (
+    persistence: HarnessPersistence,
+    sessionId: string,
+  ): Promise<{ readonly meta: HarnessSessionHeader; readonly events: readonly unknown[] }> => {
+    if (typeof persistence.readFrom === 'function') return persistence.readFrom(sessionId, 0)
+    if (typeof persistence.load === 'function') return persistence.load(sessionId)
+    throw internalError('this session store offers no way to read a stored conversation')
+  }
+
+  /** Whether this composition can put an agent back on a stored session. */
+  const canResume = (): boolean => store !== undefined && typeof ctx.agents.resume === 'function'
+
+  /**
+   * The half `session/load` and `session/resume` share: check the store, put
+   * an agent back on the session, and register it.
+   *
+   * Replay happens *before* the agent is resumed and is held on the record
+   * rather than sent here, because the caller decides whether a client asked
+   * for history at all.
+   */
+  const reopen = async (
+    params: { sessionId?: string; cwd?: string },
+    options: { replay: boolean },
+  ): Promise<{ record: Record_; sessionId: string }> => {
+    if (closed) throw internalError('the adapter has been disposed')
+    const sessionId = params.sessionId
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throw invalidParams('a session id is required')
+    }
+    const live = sessions.get(sessionId)
+    if (live !== undefined) return { record: live, sessionId }
+    if (store === undefined || typeof ctx.agents.resume !== 'function') {
+      throw invalidParams('this harness keeps no session store, so nothing can be reopened')
+    }
+
+    const projection = new SessionProjection({ replay: options.replay })
+    let replayed: readonly AcpUpdate[] | undefined
+    let cwd = params.cwd
+    if (options.replay) {
+      const stored = await readStored(store, sessionId)
+      cwd = stored.meta.cwd ?? cwd
+      const updates: AcpUpdate[] = []
+      for (const event of stored.events) {
+        // One bad event is not a lost conversation: the log outlives this
+        // adapter's knowledge of it, and an unknown shape is skipped the same
+        // way the live feed skips one.
+        try {
+          updates.push(...projection.onEvent(event as DshEvent))
+        } catch {
+          continue
+        }
+      }
+      replayed = updates
+    }
+    if (typeof cwd !== 'string' || cwd.length === 0) {
+      throw invalidParams('the stored session names no workspace, so it cannot be reopened')
+    }
+
+    const handle = await ctx.agents.resume({
+      resumeSessionId: sessionId,
+      meta: { cwd },
+      ...(config.provider !== undefined || config.model !== undefined
+        ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
+        : {}),
+    })
+    const record: Record_ = {
+      agent: handle.agent,
+      cwd,
+      projection,
+      updatedAt: Date.now(),
+      dispose: () => handle.dispose(),
+      ...(replayed !== undefined ? { replayed } : {}),
+    }
+    sessions.set(sessionId, record)
+    return { record, sessionId }
+  }
+
   const agent = (connection: AgentSideConnection) => {
     conn = connection
     return {
       initialize: () => Promise.resolve({
         protocolVersion: PROTOCOL_VERSION,
-        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: '0.3.0' },
+        agentInfo: { name: 'harnessdesk-dsh-acp', title: 'DeepSeek Harness', version: VERSION },
         agentCapabilities: {
-          // `loadSession` stays false until replay is implemented. Declaring a
-          // capability we cannot honour would earn a `session/load` we answer
-          // with an error, which is worse for a client than knowing up front.
-          loadSession: false,
-          // Listing is answered from this process's live sessions. It is what
-          // gives a client's conversation list a name and a folder instead of
-          // a row reading "Untitled session".
-          sessionCapabilities: { list: {} },
+          // Declared from what is actually mounted, never from what this
+          // adapter can spell. A composition with no persistence backend has
+          // nothing to resume and nothing to replay, and a capability we
+          // cannot honour earns a request we answer with an error — worse for
+          // a client than knowing up front.
+          //
+          // `loadSession` and `resume` are different promises and ACP keeps
+          // them apart: **load replays the conversation, resume does not.**
+          // Both are true here, which is the whole point of this adapter —
+          // the harness's own ACP server offers resume alone, so a client that
+          // reopens a conversation through it gets a live agent with an empty
+          // transcript.
+          loadSession: canResume(),
+          sessionCapabilities: {
+            list: {},
+            ...(canResume() ? { resume: {}, close: {} } : {}),
+          },
           promptCapabilities: { image: false, audio: false, embeddedContext: true },
         },
         authMethods: [],
@@ -235,22 +367,114 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
       },
 
       /**
-       * The conversations this process is holding, newest first. Sessions do
-       * not outlive the process yet — `loadSession` is false — so this lists
-       * what is live rather than reading the harness's own store.
+       * Put an agent back on a stored conversation **and replay it**.
+       *
+       * This is the verb the harness's own ACP server refuses, and refusing it
+       * is what makes that server unusable for a person: `session/resume`
+       * restores the context but explicitly does not replay history, so a
+       * client that reopens a conversation draws an empty transcript over a
+       * live agent.
+       *
+       * Replay is a fold, not a second mapper. The store keeps the same
+       * `SessionEvent` log the live feed carries, so the events go through a
+       * `SessionProjection` in replay mode and come out as the updates the
+       * client would have received the first time.
        */
-      listSessions: (params: { cwd?: string } = {}) => Promise.resolve({
-        sessions: [...sessions.entries()]
-          .filter(([, record]) => params.cwd === undefined || record.cwd === params.cwd)
-          .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
-          .map(([sessionId, record]) => ({
+      loadSession: async (params: { sessionId?: string; cwd?: string; mcpServers?: unknown }) => {
+        // Same refusal as `session/new`: a tool server offered here cannot
+        // reach a harness that is already composed, and taking it silently is
+        // worse than saying no.
+        refuseToolServers(params)
+        const { record, sessionId } = await reopen(params, { replay: true })
+        // Emitted before the response resolves, which is the contract: a
+        // client folds these into history rather than drawing them as news.
+        for (const update of record.replayed ?? []) notify(sessionId, update)
+        record.replayed = undefined
+        return { configOptions: sessionConfigOptions(config) }
+      },
+
+      /**
+       * Put an agent back on a stored conversation without replaying it.
+       *
+       * The cheaper half of the pair, for a client that keeps its own
+       * transcript and wants only the context back.
+       */
+      resumeSession: async (params: { sessionId?: string; cwd?: string; mcpServers?: unknown }) => {
+        refuseToolServers(params)
+        const { sessionId } = await reopen(params, { replay: false })
+        return { sessionId, configOptions: sessionConfigOptions(config) }
+      },
+
+      /**
+       * Let go of one conversation without ending the process or touching the
+       * store — it stays listable and resumable.
+       */
+      closeSession: async (params: { sessionId?: string }) => {
+        const record = params.sessionId === undefined ? undefined : sessions.get(params.sessionId)
+        if (record === undefined) return {}
+        if (record.inflight !== undefined) stopAgent(record.agent)
+        sessions.delete(params.sessionId as string)
+        await record.dispose()
+        return {}
+      },
+
+      /**
+       * Every conversation a client could open, newest first.
+       *
+       * The live ones and the stored ones are one list: a client should not
+       * have to know which of its conversations happen to have an agent
+       * attached right now. Live wins on a collision, because it knows the
+       * title and the preview the store has not been asked for.
+       */
+      listSessions: async (params: { cwd?: string } = {}) => {
+        const rows = new Map<string, {
+          sessionId: string
+          cwd: string
+          title: string | null
+          preview: string | null
+          updatedAt: string
+          sortAt: number
+        }>()
+        if (store !== undefined) {
+          let headers: readonly HarnessSessionHeader[] = []
+          try {
+            headers = await store.list()
+          } catch (error) {
+            // A store that cannot be read is not a reason to lose the live
+            // list; the client gets what this process knows.
+            ctx.logger?.warn(`harnessdesk-acp: could not read the session store: ${String(error)}`)
+          }
+          for (const header of headers) {
+            if (!isRootConversation(header)) continue
+            if (params.cwd !== undefined && header.cwd !== params.cwd) continue
+            const at = header.createdAt ?? 0
+            rows.set(header.id, {
+              sessionId: header.id,
+              cwd: header.cwd as string,
+              title: null,
+              preview: null,
+              updatedAt: new Date(at).toISOString(),
+              sortAt: at,
+            })
+          }
+        }
+        for (const [sessionId, record] of sessions) {
+          if (params.cwd !== undefined && record.cwd !== params.cwd) continue
+          rows.set(sessionId, {
             sessionId,
             cwd: record.cwd,
             title: record.projection.title ?? null,
             preview: record.preview ?? null,
             updatedAt: new Date(record.updatedAt).toISOString(),
-          })),
-      }),
+            sortAt: record.updatedAt,
+          })
+        }
+        return {
+          sessions: [...rows.values()]
+            .sort((a, b) => b.sortAt - a.sortAt)
+            .map(({ sortAt: _sortAt, ...row }) => row),
+        }
+      },
 
       cancel: (params: { sessionId: string }) => {
         const record = sessions.get(params.sessionId)

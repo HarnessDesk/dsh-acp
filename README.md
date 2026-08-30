@@ -33,8 +33,35 @@ the wire.
 | Token usage | — | ✅ `usage_update` + `PromptResponse.usage` |
 | Context composition | — | ✅ system / tools / messages, from the harness's own meter |
 | Model / effort / sandbox mode | — | ✅ ACP `configOptions` |
-| Conversation list | — | ✅ `session/list`, with the harness's own titles |
+| Conversation list | ✅ `session/list` (stored) | ✅ live **and** stored, with the harness's own titles |
+| Reopen a conversation | ✅ `session/resume` | ✅ `session/resume` |
+| …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
+
+### Reopening a conversation
+
+ACP separates two verbs that sound alike, and the difference decides whether a
+client can draw anything:
+
+- **`session/resume`** puts an agent back on a stored session and *explicitly
+  does not replay history*.
+- **`session/load`** replays it.
+
+`@deepseek-ai/dsh-acp` implements resume and lists `session/load` under its
+refused surfaces, which is coherent for an automation bridge that keeps no
+transcript. For a client a person is looking at, it means reopening a
+conversation gives a live agent above an empty pane.
+
+This adapter implements both. Replay is a fold, not a second mapper: the store
+keeps the same `SessionEvent` log the live feed carries, so the events go back
+through the same projection and come out as the updates the client would have
+received the first time — user turns, reasoning, tool calls with their results,
+plans and titles included.
+
+Both capabilities are declared from what is actually mounted. A composition
+without `@deepseek-ai/dsh-session-persistence` gets `loadSession: false` and no
+`resume`, and lists only what is live — rather than a promise this adapter
+cannot keep.
 
 Token usage follows ACP's [Session Context Size and Cost](https://agentclientprotocol.com/rfds/session-usage)
 RFD, including its rule that cached tokens still occupy the context window.
