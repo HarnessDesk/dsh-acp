@@ -10,6 +10,10 @@
  * @module
  */
 
+import { randomUUID } from 'node:crypto'
+
+import { harnessModule, resolutionFailures } from './resolve.ts'
+
 /** A harness session, as much of it as we touch. */
 export interface HarnessSession {
   readonly id: string
@@ -22,7 +26,37 @@ export interface HarnessAgent {
   readonly session: HarnessSession
   followup(message: unknown): void
   whenIdle(): Promise<unknown>
+  /**
+   * Stop the live turn and clear queued work.
+   * `@deepseek-ai/dsh-agent` spells this `cancel(cause, options?)` — the cause
+   * is durable, and `{ kind: 'user' }` is the one a person clicking stop
+   * means. Optional here only because this contract is structural.
+   */
+  cancel?(cause: { readonly kind: 'user' }, options?: { readonly keepInbox?: boolean }): void
+  /** What an older harness tree called the same thing. */
   abort?(): void
+}
+
+/**
+ * Stop whatever the agent is doing, on behalf of the person who asked.
+ *
+ * Written as its own function because the two spellings are the whole
+ * problem: this adapter called `abort()` alone, the live harness has only
+ * `cancel()`, and an optional call to a method that is not there is a silent
+ * no-op — which is exactly what a stop button must never be.
+ *
+ * @returns whether anything was actually asked to stop.
+ */
+export const stopAgent = (agent: Pick<HarnessAgent, 'cancel' | 'abort'>): boolean => {
+  if (typeof agent.cancel === 'function') {
+    agent.cancel({ kind: 'user' })
+    return true
+  }
+  if (typeof agent.abort === 'function') {
+    agent.abort()
+    return true
+  }
+  return false
 }
 
 export interface HarnessAgentHandle {
@@ -35,8 +69,81 @@ export interface HarnessAgents {
     sessionId: string
     meta?: Record<string, unknown>
     agentOptions?: Record<string, unknown>
+    /**
+     * Composition of the agent's scoped world, awaited before the agent is
+     * published. The only safe place to install a model selection: everything
+     * registered here exists before the first prompt assembly.
+     */
+    setup?: (agentCtx: unknown) => Promise<void> | void
+  }): Promise<HarnessAgentHandle>
+  /**
+   * Put an agent back on a session the store already holds.
+   *
+   * Optional in the type because a composition without a persistence backend
+   * has no session to resume — the adapter checks for the method rather than
+   * assuming it, and declares the capability only where both this and the
+   * store are present.
+   */
+  resume?(options: {
+    resumeSessionId: string
+    meta?: Record<string, unknown>
+    agentOptions?: Record<string, unknown>
+    setup?: (agentCtx: unknown) => Promise<void> | void
   }): Promise<HarnessAgentHandle>
   get?(id: string): HarnessAgent | undefined
+}
+
+/**
+ * The durable session log, as `@deepseek-ai/dsh-session-persistence` exposes
+ * it on `ctx.sessionPersistence`.
+ *
+ * Two calls are all this adapter needs, and both are read-only. `list` gives
+ * the conversations that exist; `load` gives one conversation's whole event
+ * log — the *same* `SessionEvent` shape the live feed carries, which is what
+ * makes replay a fold over `SessionProjection` rather than a second mapper.
+ *
+ * Typed structurally like everything else here: the harness's packages sit on
+ * independent version lines and nothing is imported from them.
+ */
+export interface HarnessPersistence {
+  list(signal?: AbortSignal): Promise<readonly HarnessSessionHeader[]>
+  /**
+   * The read-model primitive: the stored events from a sequence onward.
+   *
+   * This is the call replay wants, and `load` is not. The harness documents
+   * `readFrom` as "a detached physical suffix read: no preparation cache,
+   * torn-tail truncation, synthetic closers, or coordinator-state
+   * publication… only events from the valid contiguous stored prefix are
+   * returned". `load` prepares a session for *ownership* — it commits cold
+   * recovery and rejects a log whose committed prefix does not validate.
+   *
+   * Measured on this machine: `load` refused **every** stored session with
+   * "session event at seq N lacks an identified message", while `readFrom`
+   * reads them. Replaying a conversation is reading, not claiming, and using
+   * the ownership call for it makes old logs unopenable for no reason.
+   */
+  readFrom?(id: string, fromSeq: number, signal?: AbortSignal): Promise<{
+    readonly meta: HarnessSessionHeader
+    readonly events: readonly unknown[]
+  }>
+  /** The ownership path, kept only as a fallback where `readFrom` is absent. */
+  load?(id: string): Promise<{ readonly meta: HarnessSessionHeader; readonly events: readonly unknown[] }>
+}
+
+/** What the store knows about a conversation without opening it. */
+export interface HarnessSessionHeader {
+  readonly id: string
+  readonly createdAt?: number
+  readonly cwd?: string
+  /** Set on a forked session; a fork is not a root conversation. */
+  readonly parentSession?: string
+  /** `subagent` for a delegated child, which is not a conversation of its own. */
+  readonly origin?: string
+}
+
+/** The context inside `inject(['sessionPersistence'], …)`. */
+export interface HarnessPersistenceContext {
+  readonly sessionPersistence: HarnessPersistence
 }
 
 /** One approval the harness is asking a client to decide. */
@@ -59,6 +166,17 @@ export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled'
  */
 export interface HarnessContext {
   readonly agents: HarnessAgents
+  /**
+   * The session service, reached through `inject(['sessions'], …)` rather
+   * than read off this context — cordis refuses an undeclared service read.
+   *
+   * One method matters: **`flush` is what puts a conversation on disk.**
+   * Disposing an agent handle ends the agent; it does not drain the
+   * write-behind buffer. Without it a session's log keeps only the header the
+   * store wrote at creation, so the conversation is listed and cannot be
+   * opened — which is precisely how this behaved before.
+   */
+  readonly __sessionsDoc?: never
   readonly logger?: { warn(message: string): void; info?(message: string): void }
   on(event: string, listener: (...args: never[]) => unknown): unknown
   inject(services: readonly string[], apply: (...args: never[]) => unknown): unknown
@@ -89,26 +207,115 @@ export interface HarnessProjectionContext {
  * to the documented literal only if the import is unavailable — which in a
  * real composition it never is.
  */
+/**
+ * Whether the harness's own factory could not be reached. Reported once, by
+ * the plugin, because a silent fall-through is what hid this for so long.
+ */
+export let userMessageFallbackReason: string | undefined
+
+/**
+ * One user message, in the shape the harness's durable log demands.
+ *
+ * **The `id` is not optional and its absence is silent.** The harness
+ * validates every `user/message`, `assistant/message` and `tool/result` in a
+ * session log with `assertMessageEventShape`, which requires a non-empty
+ * string `id`, a matching `role`, a `source.kind` and an array `content`. An
+ * event that fails it throws `"session event at seq N lacks an identified
+ * message"` — and that throw does not surface when the message is written. It
+ * surfaces later, when something tries to *read the log back*, by which time
+ * the conversation is unreadable and unresumable.
+ *
+ * This adapter minted the fallback without an id, and the dynamic `import()`
+ * that would have used the harness's own factory never resolved — ESM
+ * `import()` does not consult `NODE_PATH`, which is exactly how the harness's
+ * packages are put on the path for a plugin like this one. So the fallback was
+ * not a fallback at all: it was the only path, and every conversation this
+ * adapter ever created was rejected by the harness's own validator.
+ *
+ * The fallback now mints the same id the harness does —
+ * `id: MessageId(crypto.randomUUID())` in `@deepseek-ai/dsh-llm`'s
+ * `createMessage`, where `MessageId` is a branded-type identity and the value
+ * is the plain UUID.
+ */
 export const createUserMessage = async (text: string): Promise<unknown> => {
-  try {
-    // The specifier is built at runtime so the compiler does not try to
-    // resolve an optional peer that is only present inside a live harness.
-    const specifier = ['@deepseek-ai', 'dsh-llm'].join('/')
-    const llm = (await import(specifier)) as {
-      createUserMessage?: (input: unknown) => unknown
-    }
-    if (typeof llm.createUserMessage === 'function') {
-      return llm.createUserMessage({
-        content: [{ type: 'text', text }],
-        source: { kind: 'user' },
-      })
-    }
-  } catch {
-    // Fall through: a host without the package is a test double, not a rig.
+  const llm = await harnessModule<{ createUserMessage?: (input: unknown) => unknown }>(
+    ['@deepseek-ai', 'dsh-llm'].join('/'),
+  )
+  if (typeof llm?.createUserMessage === 'function') {
+    return llm.createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'user' },
+    })
   }
+  userMessageFallbackReason ??=
+    resolutionFailures.get('@deepseek-ai/dsh-llm') ?? 'resolved but exports no createUserMessage'
   return {
+    id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
     source: { kind: 'user' },
   }
+}
+
+
+/**
+ * Switch a session's sandbox mode.
+ *
+ * `setSandboxMode(session, mode)` is a free function on
+ * `@deepseek-ai/dsh-sandbox-policy`, not a method on a service, so it has to
+ * be resolved rather than read off the context. The harness applies it to
+ * "the session's next confined call (bash or fs) — the consumers fold on
+ * every read", so the switch lands on the next tool call rather than
+ * retroactively.
+ *
+ * Returns false when this composition has no sandbox policy, which is a real
+ * composition and not an error — the caller says so instead of pretending the
+ * change took.
+ */
+export const sandboxModeAvailable = async (): Promise<boolean> => {
+  const policy = await harnessModule<{ setSandboxMode?: unknown }>(
+    ['@deepseek-ai', 'dsh-sandbox-policy'].join('/'),
+  )
+  return typeof policy?.setSandboxMode === 'function'
+}
+
+export const setSandboxMode = async (session: HarnessSession, mode: string): Promise<boolean> => {
+  const policy = await harnessModule<{
+    setSandboxMode?: (session: HarnessSession, mode: string) => void
+  }>(['@deepseek-ai', 'dsh-sandbox-policy'].join('/'))
+  if (typeof policy?.setSandboxMode !== 'function') return false
+  policy.setSandboxMode(session, mode)
+  return true
+}
+
+
+/** The selection `installModelSelection` reads before every prompt assembly. */
+export interface ModelSelectionRef {
+  current: { provider: string; model: string; reasoningEffort?: string } | undefined
+  assembled: { provider: string; model: string; reasoningEffort?: string } | undefined
+}
+
+/**
+ * Couple a mutable model selection to one agent's prompt assembly.
+ *
+ * `installModelSelection(agentCtx, ref)` is how the harness lets a caller
+ * change the route of a *running* agent: prompt assembly reads `ref.current`
+ * before each step, so a switch "takes effect on a later step instead of
+ * splitting the two surfaces". Without it a model picker can only remember a
+ * choice, which is how this adapter came to show "Flash" over an agent that
+ * answered "I am the DeepSeek v4 Pro model".
+ *
+ * Returns false when the harness offers no such coupling; the caller then
+ * declines to advertise a control it cannot honour.
+ */
+export const installModelSelection = async (
+  agentCtx: unknown,
+  selection: ModelSelectionRef,
+): Promise<boolean> => {
+  const agent = await harnessModule<{
+    installModelSelection?: (ctx: unknown, ref: ModelSelectionRef) => unknown
+  }>(['@deepseek-ai', 'dsh-agent'].join('/'))
+  if (typeof agent?.installModelSelection !== 'function') return false
+  agent.installModelSelection(agentCtx, selection)
+  return true
 }

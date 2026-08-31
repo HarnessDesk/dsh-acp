@@ -162,6 +162,13 @@ export class SessionProjection {
   readonly #toolNames = new Map<string, string>()
 
   /** The name the harness gave this conversation, once it has named one. */
+  #preview: string | undefined
+
+  /** The opening ask, for a listed conversation the harness never titled. */
+  get preview(): string | undefined {
+    return this.#preview
+  }
+
   get title(): string | undefined {
     return this.#title
   }
@@ -452,16 +459,19 @@ export class SessionProjection {
 
   /** Replayed user turns, so a loaded session reads as a conversation. */
   #onUserMessage(data: Record<string, unknown>): AcpUpdate[] {
-    if (!this.#replay) return []
     const message = isRecord(data['message']) ? data['message'] : data
     const source = isRecord(message['source']) ? message['source'] : {}
     // Tool results are user-role messages in the harness's model; they are
     // already rendered as tool cards and must not appear twice.
     if (source['kind'] !== 'user') return []
     const text = resultTextOf(message['content'])
-    return text.length > 0
-      ? [{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } }]
-      : []
+    if (text.length === 0) return []
+    // Remembered whether or not it is projected: a listed conversation with
+    // no title falls back to the opening ask, and that is worth having even
+    // when nothing is being replayed onto the wire.
+    this.#preview ??= text.trim().slice(0, 200)
+    if (!this.#replay) return []
+    return [{ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } }]
   }
 
   /**

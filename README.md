@@ -33,8 +33,72 @@ the wire.
 | Token usage | — | ✅ `usage_update` + `PromptResponse.usage` |
 | Context composition | — | ✅ system / tools / messages, from the harness's own meter |
 | Model / effort / sandbox mode | — | ✅ ACP `configOptions` |
-| Conversation list | — | ✅ `session/list`, with the harness's own titles |
+| Conversation list | ✅ `session/list` (stored) | ✅ live **and** stored, with the harness's own titles |
+| Reopen a conversation | ✅ `session/resume` | ✅ `session/resume` |
+| …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
+
+### Node 24.0–24.11.1 and an older harness
+
+If the harness fails to boot and the stack trace names the plugin tree rather
+than your composition, check your Node version before anything else.
+
+`@deepseek-ai/cordis-plugin-loader` classified Node's internal ESM loader by
+major version — `>= 24` meant "v2" — but v2 only landed in **24.12.0**. Every
+loader in **24.0–24.11.1** was therefore mistagged, and `resolveSync` was called
+with reversed parameters, which breaks the plugin tree before any of this
+adapter's code runs. It is fixed in loader **1.0.3**, which ships with
+**DeepSeek Harness 0.1.2-alpha.2** and later.
+
+Nothing in this adapter can work around it — the failure happens while the
+harness composes itself. Either upgrade the harness, or run Node 24.12+ or
+Node 22. This adapter prints a note pointing here when a boot fails inside that
+window.
+
+`engines` deliberately still allows the range: the adapter itself is fine
+there, and so is a harness new enough to carry the fixed loader. Excluding it
+outright would refuse installs that work.
+
+### A note for anyone upgrading from 0.4.0 or earlier
+
+Conversations recorded before **0.4.1** cannot be reopened, and it is this
+adapter's fault. The harness validates every message event when a log is read
+back — `assertMessageEventShape` requires a non-empty string `id` — and this
+adapter minted user messages without one. Nothing complains when the message is
+written; the failure appears only when something tries to read the conversation
+back, reported as `session event at seq N lacks an identified message`.
+
+The dynamic `import()` meant to borrow the harness's own message factory never
+resolved either, because ESM `import()` does not consult `NODE_PATH` — which is
+exactly how a plugin like this one is given the harness's packages. So the
+fallback was never a fallback; it was the only path. Fixed in 0.4.1, which
+mints the same `crypto.randomUUID()` id the harness does, and now says out loud
+when it is using its own factory.
+
+### Reopening a conversation
+
+ACP separates two verbs that sound alike, and the difference decides whether a
+client can draw anything:
+
+- **`session/resume`** puts an agent back on a stored session and *explicitly
+  does not replay history*.
+- **`session/load`** replays it.
+
+`@deepseek-ai/dsh-acp` implements resume and lists `session/load` under its
+refused surfaces, which is coherent for an automation bridge that keeps no
+transcript. For a client a person is looking at, it means reopening a
+conversation gives a live agent above an empty pane.
+
+This adapter implements both. Replay is a fold, not a second mapper: the store
+keeps the same `SessionEvent` log the live feed carries, so the events go back
+through the same projection and come out as the updates the client would have
+received the first time — user turns, reasoning, tool calls with their results,
+plans and titles included.
+
+Both capabilities are declared from what is actually mounted. A composition
+without `@deepseek-ai/dsh-session-persistence` gets `loadSession: false` and no
+`resume`, and lists only what is live — rather than a promise this adapter
+cannot keep.
 
 Token usage follows ACP's [Session Context Size and Cost](https://agentclientprotocol.com/rfds/session-usage)
 RFD, including its rule that cached tokens still occupy the context window.
