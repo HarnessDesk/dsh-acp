@@ -169,3 +169,27 @@ describe('the user message this adapter mints', () => {
     expect(typeof mod.userMessageFallbackReason).toBe('string')
   })
 })
+
+describe('the Node 24 loader window', () => {
+  // The predicate lives in `bin.ts`, which boots a harness on import, so the
+  // rule itself is restated here. What is under test is the comparison, and
+  // the reason is a string sort: `'24.9.0' < '24.12.0'` is **false**
+  // lexicographically, so a naive check excludes exactly the versions the
+  // window is meant to catch.
+  const inWindow = (version: string): boolean => {
+    const [major = 0, minor = 0] = version.split('.').map(Number)
+    return major === 24 && minor < 12
+  }
+
+  it('catches the whole 24.0–24.11.1 range, single- and double-digit minors alike', () => {
+    for (const version of ['24.0.0', '24.9.0', '24.11.1']) {
+      expect(inWindow(version)).toBe(true)
+    }
+  })
+
+  it('leaves the versions that were never broken alone', () => {
+    for (const version of ['22.15.0', '24.12.0', '24.13.0', '25.9.0']) {
+      expect(inWindow(version)).toBe(false)
+    }
+  })
+})

@@ -38,6 +38,27 @@ the wire.
 | …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
 
+### Node 24.0–24.11.1 and an older harness
+
+If the harness fails to boot and the stack trace names the plugin tree rather
+than your composition, check your Node version before anything else.
+
+`@deepseek-ai/cordis-plugin-loader` classified Node's internal ESM loader by
+major version — `>= 24` meant "v2" — but v2 only landed in **24.12.0**. Every
+loader in **24.0–24.11.1** was therefore mistagged, and `resolveSync` was called
+with reversed parameters, which breaks the plugin tree before any of this
+adapter's code runs. It is fixed in loader **1.0.3**, which ships with
+**DeepSeek Harness 0.1.2-alpha.2** and later.
+
+Nothing in this adapter can work around it — the failure happens while the
+harness composes itself. Either upgrade the harness, or run Node 24.12+ or
+Node 22. This adapter prints a note pointing here when a boot fails inside that
+window.
+
+`engines` deliberately still allows the range: the adapter itself is fine
+there, and so is a harness new enough to carry the fixed loader. Excluding it
+outright would refuse installs that work.
+
 ### A note for anyone upgrading from 0.4.0 or earlier
 
 Conversations recorded before **0.4.1** cannot be reopened, and it is this
