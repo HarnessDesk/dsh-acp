@@ -19,9 +19,9 @@ import {
 } from '@agentclientprotocol/sdk'
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
-import { createUserMessage, installModelSelection, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
+import { createUserMessage, installModelSelection, sandboxModeAvailable, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
 import { SessionProjection } from './project.ts'
-import { sessionConfigOptions, type AdapterConfig } from './options.ts'
+import { sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
 
 /**
@@ -58,10 +58,38 @@ interface Record_ {
    * couple one. Mutating `current` is what makes the model picker real.
    */
   selection?: ModelSelectionRef | undefined
+  /** Whether a sandbox policy is mounted, so `mode` can actually be switched. */
+  modeSupported?: boolean | undefined
 }
 
 const invalidParams = (detail: string): RequestError =>
   RequestError.invalidParams(undefined, detail)
+
+/** What one fold over a stored log can say about it without opening it. */
+interface StoredDescription {
+  title: string | null
+  preview: string | null
+  /** Epoch ms of the newest event, or null when nothing carried a time. */
+  lastActivityAt: number | null
+}
+
+/**
+ * When a stored event happened, where it says so.
+ *
+ * The harness's event shapes are not ours and the field has moved between
+ * versions, so several spellings are accepted and anything unrecognised is
+ * simply absent. A row whose log carries no timestamps falls back to its
+ * creation time rather than claiming an activity it cannot evidence.
+ */
+const timestampOf = (event: unknown): number | undefined => {
+  if (typeof event !== 'object' || event === null) return undefined
+  const record = event as Record<string, unknown>
+  for (const key of ['at', 'timestamp', 'time', 'createdAt']) {
+    const value = record[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
+  }
+  return undefined
+}
 
 /**
  * Whether a stored header is a conversation someone can reopen.
@@ -118,7 +146,15 @@ export const inject = ['agents']
  * @param ctx - the harness host tree.
  * @param config - the route and transport this deployment wants.
  */
-export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
+/**
+ * @returns an async disposer. Cordis accepts one from plugin startup and
+ *   awaits it while the fiber unloads — see the teardown block at the end for
+ *   why an event listener was the wrong mechanism.
+ */
+export function apply(
+  ctx: HarnessContext,
+  config: AdapterConfig = {},
+): () => Promise<void> {
   const agents = ctx.agents
   const sessions = new Map<string, Record_>()
   let conn: AgentSideConnection | undefined
@@ -224,16 +260,23 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
    * `TITLED_ROWS` rows are read, and a title is remembered for the process's
    * lifetime. Everything else lists without one, which is the honest result of
    * a bounded read rather than a wrong title.
+   *
+   * The bound has a known edge, and it is a bound rather than a bug: rows are
+   * chosen for folding by *creation* time, so a conversation created long ago
+   * but used yesterday can fall outside the budget and be ordered by its
+   * creation time. Widening `TITLED_ROWS` narrows the window; only folding
+   * every log would close it, and that makes listing cost a full read of the
+   * whole store.
    */
-  const titleCache = new Map<string, { title: string | null; preview: string | null }>()
+  const titleCache = new Map<string, StoredDescription>()
   const TITLED_ROWS = 40
   const describeStored = async (
     persistence: HarnessPersistence,
     sessionId: string,
-  ): Promise<{ title: string | null; preview: string | null }> => {
+  ): Promise<StoredDescription> => {
     const known = titleCache.get(sessionId)
     if (known !== undefined) return known
-    const found: { title: string | null; preview: string | null } = { title: null, preview: null }
+    const found: StoredDescription = { title: null, preview: null, lastActivityAt: null }
     try {
       const stored = await readStored(persistence, sessionId)
       const projection = new SessionProjection({ replay: true })
@@ -241,7 +284,12 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         try {
           projection.onEvent(event as DshEvent)
         } catch {
-          continue
+          // Skipped for projection, but still evidence the conversation was
+          // alive at that moment — the timestamp is read below regardless.
+        }
+        const at = timestampOf(event)
+        if (at !== undefined && (found.lastActivityAt === null || at > found.lastActivityAt)) {
+          found.lastActivityAt = at
         }
       }
       found.title = projection.title ?? null
@@ -301,14 +349,62 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
    * rather than thrown — a conversation that will not flush is still a
    * conversation the person should be allowed to close.
    */
-  const flushSession = async (record: Record_): Promise<void> => {
+  const flushSession = async (
+    record: Record_,
+    options: { rethrow?: boolean } = {},
+  ): Promise<void> => {
     const flush = sessionService?.flush
     if (typeof flush !== 'function') return
     try {
       await flush.call(sessionService, record.agent.session)
     } catch (error) {
       ctx.logger?.warn(`harnessdesk-acp: could not flush the session log: ${String(error)}`)
+      // An explicit close reports it: the caller asked for this write and is
+      // the only one who can decide to retry. A shutdown sweep does not —
+      // one unwritable conversation must not stop the others being written.
+      if (options.rethrow === true) {
+        throw internalError(
+          `the conversation could not be written to the session store, so it was left open: ${String(error)}`,
+        )
+      }
     }
+  }
+
+  /**
+   * What a session can honour, for the option list it is handed.
+   *
+   * `mode` is probed once per process — the sandbox policy is a composition
+   * fact, not a per-session one — and cached on the record so a list call
+   * never waits on a module resolution twice.
+   */
+  const supportOf = async (record: Record_): Promise<ControlSupport> => {
+    record.modeSupported ??= await sandboxModeAvailable()
+    return { route: record.selection !== undefined, mode: record.modeSupported }
+  }
+
+  /** The route this adapter was configured with, when it names a whole one. */
+  const defaultRoute = (
+    cfg: AdapterConfig,
+  ): { provider: string; model: string } | undefined =>
+    cfg.provider !== undefined && cfg.model !== undefined
+      ? { provider: cfg.provider, model: cfg.model }
+      : undefined
+
+  /**
+   * The route a stored session last ran on, where the header records one.
+   *
+   * A reopened conversation should continue on the model it was having, not
+   * on whatever this deployment happens to default to. Read defensively: the
+   * header is the harness's shape, not ours, and an absent route simply falls
+   * back to the configured one.
+   */
+  const routeOf = (
+    meta: HarnessSessionHeader,
+  ): { provider: string; model: string } | undefined => {
+    const raw = meta as unknown as { provider?: unknown; model?: unknown }
+    return typeof raw.provider === 'string' && typeof raw.model === 'string'
+      ? { provider: raw.provider, model: raw.model }
+      : undefined
   }
 
   /** Whether this composition can put an agent back on a stored session. */
@@ -337,32 +433,67 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
       throw invalidParams('this harness keeps no session store, so nothing can be reopened')
     }
 
-    const projection = new SessionProjection({ replay: options.replay })
+    // The stored header decides the workspace, and a client that asked for a
+    // different one is refused rather than quietly redirected.
+    //
+    // `agents.resume` restores the persisted header and ignores the `meta`
+    // passed alongside it, so a mismatch does not move the agent — it moves
+    // only the client's belief about where its tools are running. A client
+    // that asked for project B and got project A's agent would watch edits
+    // land in the wrong repository.
+    const stored = await readStored(store, sessionId)
+    const cwd = stored.meta.cwd
+    if (typeof cwd !== 'string' || cwd.length === 0) {
+      throw invalidParams('the stored session names no workspace, so it cannot be reopened')
+    }
+    if (typeof params.cwd === 'string' && params.cwd.length > 0 && params.cwd !== cwd) {
+      throw invalidParams(
+        `this conversation belongs to ${cwd}, not ${params.cwd}; reopening it cannot move it`,
+      )
+    }
+
+    // History is folded through a **throwaway** projection, and the live
+    // record gets a fresh one.
+    //
+    // A replay-mode projection keeps emitting `user_message_chunk` for every
+    // user message it sees, which after a load means echoing back the prompt
+    // the client has only just sent. It also carries the whole replayed
+    // history in its per-turn token accumulator, so the first new
+    // `PromptResponse.usage` would bill the conversation twice. Neither state
+    // belongs to the live session.
     let replayed: readonly AcpUpdate[] | undefined
-    let cwd = params.cwd
     if (options.replay) {
-      const stored = await readStored(store, sessionId)
-      cwd = stored.meta.cwd ?? cwd
+      const history = new SessionProjection({ replay: true })
       const updates: AcpUpdate[] = []
       for (const event of stored.events) {
         // One bad event is not a lost conversation: the log outlives this
         // adapter's knowledge of it, and an unknown shape is skipped the same
         // way the live feed skips one.
         try {
-          updates.push(...projection.onEvent(event as DshEvent))
+          updates.push(...history.onEvent(event as DshEvent))
         } catch {
           continue
         }
       }
       replayed = updates
     }
-    if (typeof cwd !== 'string' || cwd.length === 0) {
-      throw invalidParams('the stored session names no workspace, so it cannot be reopened')
-    }
 
+    // The same coupling a fresh session gets. Without it a reopened
+    // conversation advertised model and effort and then refused every choice
+    // with "this harness composition fixes the route at startup" — a control
+    // that is broken only after being reopened is worse than one that is
+    // never offered.
+    const selection: ModelSelectionRef = {
+      current: routeOf(stored.meta) ?? defaultRoute(config),
+      assembled: undefined,
+    }
+    let coupled = false
     const handle = await ctx.agents.resume({
       resumeSessionId: sessionId,
       meta: { cwd },
+      setup: async (agentCtx) => {
+        coupled = await installModelSelection(agentCtx, selection)
+      },
       ...(config.provider !== undefined || config.model !== undefined
         ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
         : {}),
@@ -370,9 +501,10 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
     const record: Record_ = {
       agent: handle.agent,
       cwd,
-      projection,
+      projection: new SessionProjection(),
       updatedAt: Date.now(),
       chosen: new Map(),
+      ...(coupled ? { selection } : {}),
       dispose: () => handle.dispose(),
       ...(replayed !== undefined ? { replayed } : {}),
     }
@@ -461,7 +593,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
           dispose: () => handle.dispose(),
         }
         sessions.set(sessionId, record)
-        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen) }
+        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen, await supportOf(record)) }
       },
 
       prompt: async (params: { sessionId: string; prompt: readonly unknown[] }) => {
@@ -521,7 +653,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         // client folds these into history rather than drawing them as news.
         for (const update of record.replayed ?? []) notify(sessionId, update)
         record.replayed = undefined
-        return { configOptions: sessionConfigOptions(config, record.chosen) }
+        return { configOptions: sessionConfigOptions(config, record.chosen, await supportOf(record)) }
       },
 
       /**
@@ -533,7 +665,7 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
       resumeSession: async (params: { sessionId?: string; cwd?: string; mcpServers?: unknown }) => {
         refuseToolServers(params)
         const { record, sessionId } = await reopen(params, { replay: false })
-        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen) }
+        return { sessionId, configOptions: sessionConfigOptions(config, record.chosen, await supportOf(record)) }
       },
 
       /**
@@ -541,11 +673,28 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
        * store — it stays listable and resumable.
        */
       closeSession: async (params: { sessionId?: string }) => {
-        const record = params.sessionId === undefined ? undefined : sessions.get(params.sessionId)
+        const sessionId = params.sessionId
+        const record = sessionId === undefined ? undefined : sessions.get(sessionId)
         if (record === undefined) return {}
-        if (record.inflight !== undefined) stopAgent(record.agent)
-        sessions.delete(params.sessionId as string)
-        await flushSession(record)
+        // Stop first, then let the turn settle, then flush. Taking the final
+        // flush while a turn is still unwinding writes a log that is missing
+        // its own last events.
+        if (record.inflight !== undefined) {
+          stopAgent(record.agent)
+          try {
+            await record.agent.whenIdle()
+          } catch {
+            // A cancellation that fails to settle cleanly is still a stop;
+            // the flush below is what decides whether anything was lost.
+          }
+        }
+        // **The session survives a failed flush.** Closing is the last chance
+        // to write the tail, so a rejection here must not be followed by
+        // deleting the record and disposing the handle — that turns "disk
+        // full" into a conversation that cannot be retried or recovered. The
+        // caller is told, and everything stays where it was.
+        await flushSession(record, { rethrow: true })
+        sessions.delete(sessionId as string)
         await record.dispose()
         return {}
       },
@@ -584,8 +733,14 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
             stored.slice(0, TITLED_ROWS).map((header) => describeStored(store!, header.id)),
           )
           for (const [index, header] of stored.entries()) {
-            const at = header.createdAt ?? 0
-            const describe = named[index] ?? { title: null, preview: null }
+            const describe = named[index] ?? { title: null, preview: null, lastActivityAt: null }
+            // ACP's `updatedAt` is last activity, not creation. Sorting and
+            // reporting creation time put an old conversation used minutes
+            // ago below a newer one nobody has touched since — and told the
+            // person it had not been updated since the day it was made. The
+            // fold that reads title and preview already walks the log, so the
+            // newest event costs nothing extra.
+            const at = describe.lastActivityAt ?? header.createdAt ?? 0
             rows.set(header.id, {
               sessionId: header.id,
               cwd: header.cwd as string,
@@ -640,7 +795,9 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         // client that sends the obvious one should not get "unknown option".
         const optionId = params.configId ?? params.optionId ?? ''
         const value = params.value ?? ''
-        const option = sessionConfigOptions(config).find((entry) => entry.id === optionId)
+        const option = sessionConfigOptions(config, record.chosen, await supportOf(record)).find(
+          (entry) => entry.id === optionId,
+        )
         if (option === undefined) throw invalidParams(`unknown option ${JSON.stringify(optionId)}`)
         if (!option.options.some((choice) => choice.value === value)) {
           throw invalidParams(`${optionId} has no choice ${JSON.stringify(value)}`)
@@ -676,16 +833,19 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
         }
         record.chosen.set(optionId, value)
         record.updatedAt = Date.now()
-        return { configOptions: sessionConfigOptions(config, record.chosen) }
+        return { configOptions: sessionConfigOptions(config, record.chosen, await supportOf(record)) }
       },
 
       cancel: (params: { sessionId: string }) => {
         const record = sessions.get(params.sessionId)
         if (record === undefined) return Promise.resolve()
-        record.cancelled = true
-        if (!stopAgent(record.agent)) {
-          // Better a line in the log than a stop button that reports success
-          // and leaves the model running.
+        // The flag is set only when a stop was actually asked for. An agent
+        // with neither `cancel` nor `abort` runs to completion, and reporting
+        // `cancelled` for a turn that finished normally tells the client its
+        // stop worked when the model simply kept going.
+        if (stopAgent(record.agent)) {
+          record.cancelled = true
+        } else {
           ctx.logger?.warn(
             'harnessdesk-acp: this harness agent offers neither cancel() nor abort(); the turn was left running',
           )
@@ -702,13 +862,26 @@ export function apply(ctx: HarnessContext, config: AdapterConfig = {}): void {
   // eslint-disable-next-line no-new -- the connection registers itself on the stream.
   new AgentSideConnection(agent as never, stream as never)
 
-  ctx.on('dispose', (() => {
+  // Teardown is a **disposer**, not an event listener.
+  //
+  // Cordis emits no `dispose` event — `ctx.on('dispose', …)` registered an
+  // ordinary listener that nothing ever fired, so the shutdown flush this
+  // code claimed to perform never ran once. A fiber runs the disposers it
+  // was given, in reverse order, and *awaits* them when they are async.
+  // Returning one is what makes "quitting must not lose a conversation" true
+  // rather than merely written down.
+  return async () => {
     closed = true
-    // Flush before disposing: quitting the app is the commonest way a
-    // conversation ends, and it must not be the way one is lost.
-    for (const record of sessions.values()) {
-      void Promise.resolve(flushSession(record)).then(() => record.dispose())
-    }
+    // Settled, not fired and forgotten: unloading waits for this, which is
+    // the entire point. One conversation that cannot be written must not stop
+    // the rest, so failures are logged per session rather than thrown.
+    const open = [...sessions.values()]
     sessions.clear()
-  }) as (...args: never[]) => void)
+    await Promise.allSettled(
+      open.map(async (record) => {
+        await flushSession(record)
+        await record.dispose()
+      }),
+    )
+  }
 }

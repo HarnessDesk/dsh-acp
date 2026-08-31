@@ -272,6 +272,13 @@ export const createUserMessage = async (text: string): Promise<unknown> => {
  * composition and not an error — the caller says so instead of pretending the
  * change took.
  */
+export const sandboxModeAvailable = async (): Promise<boolean> => {
+  const policy = await harnessModule<{ setSandboxMode?: unknown }>(
+    ['@deepseek-ai', 'dsh-sandbox-policy'].join('/'),
+  )
+  return typeof policy?.setSandboxMode === 'function'
+}
+
 export const setSandboxMode = async (session: HarnessSession, mode: string): Promise<boolean> => {
   const policy = await harnessModule<{
     setSandboxMode?: (session: HarnessSession, mode: string) => void

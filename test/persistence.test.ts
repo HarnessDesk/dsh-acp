@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import { isRootConversation } from '../src/plugin.ts'
+import { sessionConfigOptions } from '../src/options.ts'
 import { SessionProjection } from '../src/project.ts'
 import type { AcpUpdate, DshEvent } from '../src/types.ts'
 
@@ -191,5 +192,60 @@ describe('the Node 24 loader window', () => {
     for (const version of ['22.15.0', '24.12.0', '24.13.0', '25.9.0']) {
       expect(inWindow(version)).toBe(false)
     }
+  })
+})
+
+describe('a replayed conversation does not leave replay state behind', () => {
+  // The bug: the projection used to fold history was then attached to the
+  // live session. In replay mode it keeps emitting `user_message_chunk` for
+  // every user message, so the very next prompt the client sent came straight
+  // back as a duplicate — and its per-turn token accumulator still held the
+  // whole replayed history, so the first new `PromptResponse.usage` billed
+  // the conversation twice.
+  const userEvent = recorded.find((event) => event.type === 'user/message') as DshEvent
+
+  it('a live projection never echoes the prompt the client just sent', () => {
+    const live = new SessionProjection()
+    expect(live.onEvent(userEvent)).toEqual([])
+  })
+
+  it('folding history through one projection leaves another untouched', () => {
+    const history = new SessionProjection({ replay: true })
+    for (const event of recorded) {
+      try {
+        history.onEvent(event)
+      } catch {
+        continue
+      }
+    }
+    // The history projection has a turn's worth of tokens in it.
+    expect(history.promptUsage()).toBeDefined()
+    // A fresh one, which is what the live record gets, has none — so the
+    // first new turn is billed for itself alone.
+    expect(new SessionProjection().promptUsage()).toBeUndefined()
+  })
+})
+
+describe('controls are offered only where they can be honoured', () => {
+  const config = { models: ['a', 'b'], efforts: ['low', 'high'] }
+  const ids = (support?: Parameters<typeof sessionConfigOptions>[2]): string[] =>
+    sessionConfigOptions(config, new Map(), support).map((option) => option.id)
+
+  it('offers everything a fully capable composition can do', () => {
+    expect(ids({ route: true, mode: true })).toEqual(['model', 'effort', 'mode'])
+  })
+
+  it('withholds the route pickers when nothing coupled a model selection', () => {
+    // This is the exact "picker that draws and then fails" case: without a
+    // coupled selection, choosing a model can only ever return an error.
+    expect(ids({ route: false, mode: true })).toEqual(['mode'])
+  })
+
+  it('withholds permissions when no sandbox policy is mounted', () => {
+    expect(ids({ route: true, mode: false })).toEqual(['model', 'effort'])
+  })
+
+  it('offers nothing at all when the composition can honour nothing', () => {
+    expect(ids({ route: false, mode: false })).toEqual([])
   })
 })

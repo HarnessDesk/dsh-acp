@@ -56,6 +56,22 @@ export interface ConfigOption {
  * The options a `session/new` response should carry. A control with fewer
  * than two choices is omitted: offering a picker with one entry is noise.
  */
+/**
+ * Which controls this composition can actually honour.
+ *
+ * Not a preference — a fact discovered at session setup. A composition whose
+ * agent module will not couple a model selection cannot change the route, and
+ * one with no sandbox policy cannot change the permission mode. Offering the
+ * picker anyway is the exact failure this module exists to avoid: it draws,
+ * it accepts a choice, and then it errors.
+ */
+export interface ControlSupport {
+  /** The agent accepted a coupled model selection, so route changes land. */
+  readonly route?: boolean
+  /** A sandbox policy is mounted, so the permission mode can be switched. */
+  readonly mode?: boolean
+}
+
 export const sessionConfigOptions = (
   config: AdapterConfig,
   /**
@@ -65,10 +81,16 @@ export const sessionConfigOptions = (
    * that did nothing, which is indistinguishable from one that is broken.
    */
   chosen: ReadonlyMap<string, string> = new Map(),
+  /**
+   * What this session can honour. Defaults to everything, because the pure
+   * shape of the list is what the tests describe; a live session passes what
+   * it actually installed.
+   */
+  support: ControlSupport = { route: true, mode: true },
 ): ConfigOption[] => {
   const out: ConfigOption[] = []
   const models = config.models ?? []
-  if (models.length >= 2) {
+  if (support.route !== false && models.length >= 2) {
     out.push({
       type: 'select', id: 'model', name: 'Model', category: 'model',
       currentValue: chosen.get('model') ?? config.model ?? models[0]!,
@@ -76,17 +98,19 @@ export const sessionConfigOptions = (
     })
   }
   const efforts = config.efforts ?? EFFORTS
-  if (efforts.length >= 2) {
+  if (support.route !== false && efforts.length >= 2) {
     out.push({
       type: 'select', id: 'effort', name: 'Reasoning', category: 'thought_level',
       currentValue: chosen.get('effort') ?? (efforts.includes('high') ? 'high' : efforts[0]!),
       options: efforts.map((value) => ({ value, name: label(value) })),
     })
   }
-  out.push({
-    type: 'select', id: 'mode', name: 'Permissions', category: 'mode',
-    currentValue: chosen.get('mode') ?? 'workspace-write',
-    options: MODES.map((value) => ({ value, name: label(value) })),
-  })
+  if (support.mode !== false) {
+    out.push({
+      type: 'select', id: 'mode', name: 'Permissions', category: 'mode',
+      currentValue: chosen.get('mode') ?? 'workspace-write',
+      options: MODES.map((value) => ({ value, name: label(value) })),
+    })
+  }
   return out
 }
