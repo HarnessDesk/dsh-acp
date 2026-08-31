@@ -108,6 +108,23 @@ export interface HarnessAgents {
 export interface HarnessPersistence {
   list(signal?: AbortSignal): Promise<readonly HarnessSessionHeader[]>
   /**
+   * Header **and revision** per stored session, without loading a log.
+   *
+   * The revision is the store's own answer to "has this changed": the harness
+   * documents it as an opaque token where "repeated observations of an
+   * unchanged log return the same revision". It is what lets a fold be cached
+   * without the cache going stale — which matters most for a *negative*
+   * verdict, because a session cached as silent and later spoken in would
+   * otherwise stay hidden for the life of the process.
+   *
+   * Optional: a backend without it falls back to `list`, and the caller then
+   * refuses to cache anything it could not prove still current.
+   */
+  listSnapshots?(signal?: AbortSignal): Promise<readonly {
+    readonly header: HarnessSessionHeader
+    readonly revision: string
+  }[]>
+  /**
    * The read-model primitive: the stored events from a sequence onward.
    *
    * This is the call replay wants, and `load` is not. The harness documents

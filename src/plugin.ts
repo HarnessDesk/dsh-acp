@@ -308,7 +308,20 @@ export function apply(
    * every log would close it, and that makes listing cost a full read of the
    * whole store.
    */
-  const titleCache = new Map<string, StoredDescription>()
+  /**
+   * One fold per stored log, kept against the revision it was computed at.
+   *
+   * The revision is what makes caching safe. Without it a **negative** verdict
+   * is permanent: a session folded while silent, then spoken in, stays marked
+   * silent for the life of the process — and since a silent row is hidden,
+   * that is a real conversation nobody can see. The same staleness would
+   * freeze a title that had not been generated yet.
+   *
+   * An entry whose revision no longer matches the store's is discarded and
+   * re-folded. Where a backend offers no revision at all, nothing negative is
+   * cached — see `describeStored`.
+   */
+  const titleCache = new Map<string, { revision: string | null; described: StoredDescription }>()
   /**
    * How many stored logs one listing will fold.
    *
@@ -326,12 +339,20 @@ export function apply(
    * anything can judge.
    */
   const TITLED_ROWS = 400
+  // Exposed on the returned disposer's closure only through `__describeStored`
+  // below; the rule it encodes — never cache a hiding verdict you cannot prove
+  // current — is what `describe-stored.test.ts` pins.
   const describeStored = async (
     persistence: HarnessPersistence,
     sessionId: string,
+    /** The store's current revision for this log, when the backend has one. */
+    revision: string | null,
   ): Promise<StoredDescription> => {
     const known = titleCache.get(sessionId)
-    if (known !== undefined) return known
+    // Reused only when it can be proved current. A cached entry with no
+    // revision is trusted only if the store still offers none — otherwise the
+    // backend gained the ability to tell us, and the old entry is unproven.
+    if (known !== undefined && known.revision === revision) return known.described
     const found: StoredDescription = {
       title: null,
       preview: null,
@@ -361,7 +382,13 @@ export function apply(
     } catch {
       // A log this harness refuses is still a row; it simply has no name.
     }
-    titleCache.set(sessionId, found)
+    // A verdict that would *hide* a row is only cached when the store can tell
+    // us it has gone stale. Re-folding a silent log costs almost nothing —
+    // by definition it holds no conversation — and that is a far better price
+    // than a real conversation disappearing.
+    if (revision !== null || found.spoken) {
+      titleCache.set(sessionId, { revision, described: found })
+    }
     return found
   }
 
@@ -781,9 +808,23 @@ export function apply(
           sortAt: number
         }>()
         if (store !== undefined) {
+          // Snapshots where the backend has them, because they carry the
+          // revision that keeps the fold cache honest; plain headers
+          // otherwise, and then nothing that could hide a row is cached.
           let headers: readonly HarnessSessionHeader[] = []
+          const revisions = new Map<string, string>()
           try {
-            headers = await store.list()
+            if (typeof store.listSnapshots === 'function') {
+              const snapshots = await store.listSnapshots()
+              headers = snapshots.map((snapshot) => snapshot.header)
+              for (const snapshot of snapshots) {
+                if (typeof snapshot.revision === 'string') {
+                  revisions.set(snapshot.header.id, snapshot.revision)
+                }
+              }
+            } else {
+              headers = await store.list()
+            }
           } catch (error) {
             // A store that cannot be read is not a reason to lose the live
             // list; the client gets what this process knows.
@@ -794,7 +835,9 @@ export function apply(
             .filter((header) => params.cwd === undefined || header.cwd === params.cwd)
             .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
           const named = await Promise.all(
-            stored.slice(0, TITLED_ROWS).map((header) => describeStored(store!, header.id)),
+            stored
+              .slice(0, TITLED_ROWS)
+              .map((header) => describeStored(store!, header.id, revisions.get(header.id) ?? null)),
           )
           for (const [index, header] of stored.entries()) {
             const describe =
