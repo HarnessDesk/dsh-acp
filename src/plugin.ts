@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -71,6 +71,24 @@ interface StoredDescription {
   preview: string | null
   /** Epoch ms of the newest event, or null when nothing carried a time. */
   lastActivityAt: number | null
+  /**
+   * Whether the log could be read at all.
+   *
+   * Load-bearing, and not the same as "it was empty": a log this harness
+   * refuses to parse tells us nothing about what is in it, and a row we could
+   * not inspect must be shown rather than hidden on a guess.
+   */
+  read: boolean
+  /**
+   * Whether anyone ever spoke in it.
+   *
+   * Every prompt this adapter sends becomes a `user/message`, so a stored
+   * session without one is a session that was opened and abandoned — the
+   * harness writes a header and a `sandbox/mode` the moment an agent is
+   * composed, whether or not a person ever types. Those are litter, one per
+   * app launch, and they filled the list with untitled rows nobody started.
+   */
+  spoken: boolean
 }
 
 /**
@@ -89,6 +107,28 @@ const timestampOf = (event: unknown): number | undefined => {
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
   }
   return undefined
+}
+
+/**
+ * Whether a stored event is a person speaking.
+ *
+ * A tool result is a user-role message in the harness's model, so the source
+ * decides rather than the role — counting tool results would make every
+ * abandoned session that happened to run a tool look like a conversation.
+ */
+export const isUserMessage = (event: unknown): boolean => {
+  if (typeof event !== 'object' || event === null) return false
+  const record = event as Record<string, unknown>
+  if (record['type'] !== 'user/message') return false
+  const data = record['data']
+  const payload = typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : record
+  const inner = payload['message']
+  const message = typeof inner === 'object' && inner !== null ? (inner as Record<string, unknown>) : payload
+  const source = message['source']
+  const kind = typeof source === 'object' && source !== null
+    ? (source as Record<string, unknown>)['kind']
+    : undefined
+  return kind === 'user'
 }
 
 /**
@@ -269,18 +309,42 @@ export function apply(
    * whole store.
    */
   const titleCache = new Map<string, StoredDescription>()
-  const TITLED_ROWS = 40
+  /**
+   * How many stored logs one listing will fold.
+   *
+   * Measured, not guessed: 63 sessions folded in **132ms cold and ~15ms warm**
+   * — about 3ms each — and the result is cached for the life of the process,
+   * so it is a one-time cost per session. The old budget of 40 was set from
+   * caution rather than measurement, and it was too low to be useful: an
+   * abandoned session ages out of the window and reappears in the list, and
+   * so does an old conversation used recently.
+   *
+   * A ceiling still exists, because this is linear in the size of the store
+   * and a machine with thousands of conversations should not pay seconds on
+   * its first listing. Rows past it are listed from their headers alone —
+   * shown, never hidden, because a row nothing has inspected is not a row
+   * anything can judge.
+   */
+  const TITLED_ROWS = 400
   const describeStored = async (
     persistence: HarnessPersistence,
     sessionId: string,
   ): Promise<StoredDescription> => {
     const known = titleCache.get(sessionId)
     if (known !== undefined) return known
-    const found: StoredDescription = { title: null, preview: null, lastActivityAt: null }
+    const found: StoredDescription = {
+      title: null,
+      preview: null,
+      lastActivityAt: null,
+      read: false,
+      spoken: false,
+    }
     try {
       const stored = await readStored(persistence, sessionId)
+      found.read = true
       const projection = new SessionProjection({ replay: true })
       for (const event of stored.events) {
+        if (isUserMessage(event)) found.spoken = true
         try {
           projection.onEvent(event as DshEvent)
         } catch {
@@ -733,7 +797,15 @@ export function apply(
             stored.slice(0, TITLED_ROWS).map((header) => describeStored(store!, header.id)),
           )
           for (const [index, header] of stored.entries()) {
-            const describe = named[index] ?? { title: null, preview: null, lastActivityAt: null }
+            const describe =
+              named[index] ??
+              ({ title: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
+            // Hidden only when the log was actually read *and* held no user
+            // message. A log that could not be parsed, or one past the fold
+            // budget, is listed — a row nothing has inspected is not a row
+            // anything can judge, and hiding a real conversation is far worse
+            // than showing an abandoned one.
+            if (describe.read && !describe.spoken) continue
             // ACP's `updatedAt` is last activity, not creation. Sorting and
             // reporting creation time put an old conversation used minutes
             // ago below a newer one nobody has touched since — and told the

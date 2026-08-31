@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
-import { isRootConversation } from '../src/plugin.ts'
+import { isRootConversation, isUserMessage } from '../src/plugin.ts'
 import { sessionConfigOptions } from '../src/options.ts'
 import { SessionProjection } from '../src/project.ts'
 import type { AcpUpdate, DshEvent } from '../src/types.ts'
@@ -247,5 +247,36 @@ describe('controls are offered only where they can be honoured', () => {
 
   it('offers nothing at all when the composition can honour nothing', () => {
     expect(ids({ route: false, mode: false })).toEqual([])
+  })
+})
+
+describe('a session nobody spoke in is not a conversation', () => {
+  // The harness writes a header and a `sandbox/mode` the moment an agent is
+  // composed, so a session opened and never prompted persists anyway — one
+  // per app launch, each arriving in the list as an untitled row nobody
+  // started.
+  const userMessage = recorded.find((event) => event.type === 'user/message')
+
+  it('recognises a person speaking', () => {
+    expect(isUserMessage(userMessage)).toBe(true)
+  })
+
+  it('does not count a tool result as someone speaking', () => {
+    // Tool results are user-role messages in the harness's model. Counting
+    // them would make every abandoned session that ran a tool look like a
+    // conversation, which is the opposite of the point.
+    expect(
+      isUserMessage({
+        type: 'user/message',
+        data: { message: { role: 'user', source: { kind: 'tool', callId: 'c1' }, content: [] } },
+      }),
+    ).toBe(false)
+  })
+
+  it('does not count the events an abandoned session leaves behind', () => {
+    expect(isUserMessage({ type: 'session', id: 's', createdAt: 1 })).toBe(false)
+    expect(isUserMessage({ type: 'sandbox/mode', data: { mode: 'workspace-write' } })).toBe(false)
+    expect(isUserMessage(null)).toBe(false)
+    expect(isUserMessage('nonsense')).toBe(false)
   })
 })
