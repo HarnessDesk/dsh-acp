@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -71,6 +71,24 @@ interface StoredDescription {
   preview: string | null
   /** Epoch ms of the newest event, or null when nothing carried a time. */
   lastActivityAt: number | null
+  /**
+   * Whether the log could be read at all.
+   *
+   * Load-bearing, and not the same as "it was empty": a log this harness
+   * refuses to parse tells us nothing about what is in it, and a row we could
+   * not inspect must be shown rather than hidden on a guess.
+   */
+  read: boolean
+  /**
+   * Whether anyone ever spoke in it.
+   *
+   * Every prompt this adapter sends becomes a `user/message`, so a stored
+   * session without one is a session that was opened and abandoned — the
+   * harness writes a header and a `sandbox/mode` the moment an agent is
+   * composed, whether or not a person ever types. Those are litter, one per
+   * app launch, and they filled the list with untitled rows nobody started.
+   */
+  spoken: boolean
 }
 
 /**
@@ -89,6 +107,28 @@ const timestampOf = (event: unknown): number | undefined => {
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value
   }
   return undefined
+}
+
+/**
+ * Whether a stored event is a person speaking.
+ *
+ * A tool result is a user-role message in the harness's model, so the source
+ * decides rather than the role — counting tool results would make every
+ * abandoned session that happened to run a tool look like a conversation.
+ */
+export const isUserMessage = (event: unknown): boolean => {
+  if (typeof event !== 'object' || event === null) return false
+  const record = event as Record<string, unknown>
+  if (record['type'] !== 'user/message') return false
+  const data = record['data']
+  const payload = typeof data === 'object' && data !== null ? (data as Record<string, unknown>) : record
+  const inner = payload['message']
+  const message = typeof inner === 'object' && inner !== null ? (inner as Record<string, unknown>) : payload
+  const source = message['source']
+  const kind = typeof source === 'object' && source !== null
+    ? (source as Record<string, unknown>)['kind']
+    : undefined
+  return kind === 'user'
 }
 
 /**
@@ -268,19 +308,64 @@ export function apply(
    * every log would close it, and that makes listing cost a full read of the
    * whole store.
    */
-  const titleCache = new Map<string, StoredDescription>()
-  const TITLED_ROWS = 40
+  /**
+   * One fold per stored log, kept against the revision it was computed at.
+   *
+   * The revision is what makes caching safe. Without it a **negative** verdict
+   * is permanent: a session folded while silent, then spoken in, stays marked
+   * silent for the life of the process — and since a silent row is hidden,
+   * that is a real conversation nobody can see. The same staleness would
+   * freeze a title that had not been generated yet.
+   *
+   * An entry whose revision no longer matches the store's is discarded and
+   * re-folded. Where a backend offers no revision at all, nothing negative is
+   * cached — see `describeStored`.
+   */
+  const titleCache = new Map<string, { revision: string | null; described: StoredDescription }>()
+  /**
+   * How many stored logs one listing will fold.
+   *
+   * Measured, not guessed: 63 sessions folded in **132ms cold and ~15ms warm**
+   * — about 3ms each — and the result is cached for the life of the process,
+   * so it is a one-time cost per session. The old budget of 40 was set from
+   * caution rather than measurement, and it was too low to be useful: an
+   * abandoned session ages out of the window and reappears in the list, and
+   * so does an old conversation used recently.
+   *
+   * A ceiling still exists, because this is linear in the size of the store
+   * and a machine with thousands of conversations should not pay seconds on
+   * its first listing. Rows past it are listed from their headers alone —
+   * shown, never hidden, because a row nothing has inspected is not a row
+   * anything can judge.
+   */
+  const TITLED_ROWS = 400
+  // Exposed on the returned disposer's closure only through `__describeStored`
+  // below; the rule it encodes — never cache a hiding verdict you cannot prove
+  // current — is what `describe-stored.test.ts` pins.
   const describeStored = async (
     persistence: HarnessPersistence,
     sessionId: string,
+    /** The store's current revision for this log, when the backend has one. */
+    revision: string | null,
   ): Promise<StoredDescription> => {
     const known = titleCache.get(sessionId)
-    if (known !== undefined) return known
-    const found: StoredDescription = { title: null, preview: null, lastActivityAt: null }
+    // Reused only when it can be proved current. A cached entry with no
+    // revision is trusted only if the store still offers none — otherwise the
+    // backend gained the ability to tell us, and the old entry is unproven.
+    if (known !== undefined && known.revision === revision) return known.described
+    const found: StoredDescription = {
+      title: null,
+      preview: null,
+      lastActivityAt: null,
+      read: false,
+      spoken: false,
+    }
     try {
       const stored = await readStored(persistence, sessionId)
+      found.read = true
       const projection = new SessionProjection({ replay: true })
       for (const event of stored.events) {
+        if (isUserMessage(event)) found.spoken = true
         try {
           projection.onEvent(event as DshEvent)
         } catch {
@@ -297,7 +382,13 @@ export function apply(
     } catch {
       // A log this harness refuses is still a row; it simply has no name.
     }
-    titleCache.set(sessionId, found)
+    // A verdict that would *hide* a row is only cached when the store can tell
+    // us it has gone stale. Re-folding a silent log costs almost nothing —
+    // by definition it holds no conversation — and that is a far better price
+    // than a real conversation disappearing.
+    if (revision !== null || found.spoken) {
+      titleCache.set(sessionId, { revision, described: found })
+    }
     return found
   }
 
@@ -717,9 +808,23 @@ export function apply(
           sortAt: number
         }>()
         if (store !== undefined) {
+          // Snapshots where the backend has them, because they carry the
+          // revision that keeps the fold cache honest; plain headers
+          // otherwise, and then nothing that could hide a row is cached.
           let headers: readonly HarnessSessionHeader[] = []
+          const revisions = new Map<string, string>()
           try {
-            headers = await store.list()
+            if (typeof store.listSnapshots === 'function') {
+              const snapshots = await store.listSnapshots()
+              headers = snapshots.map((snapshot) => snapshot.header)
+              for (const snapshot of snapshots) {
+                if (typeof snapshot.revision === 'string') {
+                  revisions.set(snapshot.header.id, snapshot.revision)
+                }
+              }
+            } else {
+              headers = await store.list()
+            }
           } catch (error) {
             // A store that cannot be read is not a reason to lose the live
             // list; the client gets what this process knows.
@@ -730,10 +835,20 @@ export function apply(
             .filter((header) => params.cwd === undefined || header.cwd === params.cwd)
             .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
           const named = await Promise.all(
-            stored.slice(0, TITLED_ROWS).map((header) => describeStored(store!, header.id)),
+            stored
+              .slice(0, TITLED_ROWS)
+              .map((header) => describeStored(store!, header.id, revisions.get(header.id) ?? null)),
           )
           for (const [index, header] of stored.entries()) {
-            const describe = named[index] ?? { title: null, preview: null, lastActivityAt: null }
+            const describe =
+              named[index] ??
+              ({ title: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
+            // Hidden only when the log was actually read *and* held no user
+            // message. A log that could not be parsed, or one past the fold
+            // budget, is listed — a row nothing has inspected is not a row
+            // anything can judge, and hiding a real conversation is far worse
+            // than showing an abandoned one.
+            if (describe.read && !describe.spoken) continue
             // ACP's `updatedAt` is last activity, not creation. Sorting and
             // reporting creation time put an old conversation used minutes
             // ago below a newer one nobody has touched since — and told the

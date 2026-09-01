@@ -38,6 +38,24 @@ the wire.
 | …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
 | Permission prompts | ✅ allow / reject | ✅ + allow-always |
 
+### What counts as a conversation
+
+The harness writes a session header and a `sandbox/mode` the moment an agent is
+composed — before anyone types. A session opened and abandoned therefore
+persists anyway, and arrives in `session/list` as an untitled row nobody
+started, one per app launch.
+
+A stored session is listed only once something in it was a **person speaking**:
+at least one `user/message` whose source is `user`. Tool results are user-role
+messages in the harness's model, so the source decides rather than the role —
+counting those would make every abandoned session that happened to run a tool
+look like a conversation.
+
+A row is hidden only when its log was **read and found silent**. A log this
+harness refuses to parse, or one past the fold budget, is listed: a row nothing
+has inspected is not a row anything can judge, and hiding a real conversation is
+far worse than showing an abandoned one.
+
 ### Node 24.0–24.11.1 and an older harness
 
 If the harness fails to boot and the stack trace names the plugin tree rather
