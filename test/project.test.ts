@@ -596,3 +596,19 @@ describe('how a turn ended', () => {
     expect(projection.turnEnd).toBeUndefined()
   })
 })
+
+describe('where a title came from in the log', () => {
+  it('records the seq of the title event, so two folds can be compared', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'session/title', seq: 7, data: { title: 'first words' } })
+    expect(projection.titleSeq).toBe(7)
+    projection.onEvent({ type: 'session/title', seq: 19, data: { title: 'A real name' } })
+    expect(projection.title).toBe('A real name')
+    expect(projection.titleSeq).toBe(19)
+  })
+
+  it('carries a seeded position through, so a reopened record does not lose it', () => {
+    const projection = new SessionProjection({ seed: { title: 'A real name', titleSeq: 19 } })
+    expect(projection.titleSeq).toBe(19)
+  })
+})

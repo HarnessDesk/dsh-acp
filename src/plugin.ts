@@ -68,6 +68,8 @@ const invalidParams = (detail: string): RequestError =>
 /** What one fold over a stored log can say about it without opening it. */
 interface StoredDescription {
   title: string | null
+  /** Log position of the title event, so two folds can be compared. */
+  titleSeq: number | null
   preview: string | null
   /** Epoch ms of the newest event, or null when nothing carried a time. */
   lastActivityAt: number | null
@@ -359,6 +361,7 @@ export function apply(
     if (known !== undefined && known.revision === revision) return known.described
     const found: StoredDescription = {
       title: null,
+      titleSeq: null,
       preview: null,
       lastActivityAt: null,
       read: false,
@@ -382,6 +385,7 @@ export function apply(
         }
       }
       found.title = projection.title ?? null
+      found.titleSeq = projection.titleSeq ?? null
       found.preview = projection.preview ?? null
     } catch {
       // A log this harness refuses is still a row; it simply has no name.
@@ -622,6 +626,7 @@ export function apply(
       projection: new SessionProjection({
         seed: {
           ...(history.title === undefined ? {} : { title: history.title }),
+          ...(history.titleSeq === undefined ? {} : { titleSeq: history.titleSeq }),
           ...(history.preview === undefined ? {} : { preview: history.preview }),
         },
       }),
@@ -849,6 +854,7 @@ export function apply(
           preview: string | null
           updatedAt: string
           sortAt: number
+          titleSeq?: number
         }>()
         if (store !== undefined) {
           // Snapshots where the backend has them, because they carry the
@@ -885,7 +891,7 @@ export function apply(
           for (const [index, header] of stored.entries()) {
             const describe =
               named[index] ??
-              ({ title: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
+              ({ title: null, titleSeq: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
             // Hidden only when the log was actually read *and* held no user
             // message. A log that could not be parsed, or one past the fold
             // budget, is listed — a row nothing has inspected is not a row
@@ -903,6 +909,7 @@ export function apply(
               sessionId: header.id,
               cwd: header.cwd as string,
               title: describe.title,
+              ...(describe.titleSeq === null ? {} : { titleSeq: describe.titleSeq }),
               preview: describe.preview,
               updatedAt: new Date(at).toISOString(),
               sortAt: at,
@@ -911,11 +918,23 @@ export function apply(
         }
         for (const [sessionId, record] of sessions) {
           if (params.cwd !== undefined && record.cwd !== params.cwd) continue
+          // The name is whichever fold read it later in the log. The live
+          // feed has been seen to miss a `session/title` the titler wrote
+          // after the turn — the model-generated name that follows the
+          // word-count fallback — while the stored log, being the log, has
+          // it; and right after a title event the store may not have
+          // flushed it yet while the live feed has. Position in the log
+          // decides, never which fold.
+          const stored = rows.get(sessionId)
+          const storedSeq = stored?.titleSeq ?? -1
+          const liveSeq = record.projection.titleSeq ?? -1
+          const title =
+            stored?.title != null && storedSeq > liveSeq ? stored.title : record.projection.title ?? stored?.title ?? null
           rows.set(sessionId, {
             sessionId,
             cwd: record.cwd,
-            title: record.projection.title ?? null,
-            preview: record.preview ?? null,
+            title,
+            preview: record.preview ?? stored?.preview ?? null,
             updatedAt: new Date(record.updatedAt).toISOString(),
             sortAt: record.updatedAt,
           })

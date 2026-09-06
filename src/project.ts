@@ -275,15 +275,18 @@ export class SessionProjection {
        * the title and the opening ask the stored row had instead of losing
        * both the moment the conversation is opened.
        */
-      readonly seed?: { readonly title?: string; readonly preview?: string }
+      readonly seed?: { readonly title?: string; readonly titleSeq?: number; readonly preview?: string }
     } = {},
   ) {
     this.#replay = options.replay ?? false
     this.#title = options.seed?.title
+    this.#titleSeq = options.seed?.titleSeq
     this.#preview = options.seed?.preview
   }
 
   #title: string | undefined
+  /** The log position the current title was read at, for choosing between two folds. */
+  #titleSeq: number | undefined
   /** The route the log last recorded; see {@link DshRoute}. */
   #route: DshRoute | undefined
   /** How the current turn ended, when it did not simply complete. */
@@ -314,6 +317,16 @@ export class SessionProjection {
 
   get title(): string | undefined {
     return this.#title
+  }
+
+  /**
+   * Where in the log the title came from. Two folds of one conversation —
+   * the live feed and the stored log — can disagree about the name when one
+   * of them has not seen the newest `session/title` yet; the higher position
+   * is the newer name, whichever fold it came from.
+   */
+  get titleSeq(): number | undefined {
+    return this.#titleSeq
   }
 
   /**
@@ -367,7 +380,10 @@ export class SessionProjection {
         // that lists conversations shows "Untitled session" without one while
         // the harness knew exactly what it was.
         const title = asString(data['title'])?.trim()
-        if (title !== undefined && title.length > 0) this.#title = title
+        if (title !== undefined && title.length > 0) {
+          this.#title = title
+          this.#titleSeq = typeof event.seq === 'number' ? event.seq : (this.#titleSeq ?? 0) + 1
+        }
         return []
       }
       default:
