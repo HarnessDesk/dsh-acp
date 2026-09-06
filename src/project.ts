@@ -31,6 +31,7 @@ import {
   type DshContextBreakdown,
   type DshContextPressure,
   type DshEvent,
+  type DshRoute,
 } from './types.ts'
 
 /**
@@ -40,19 +41,58 @@ import {
  */
 const TOOL_KINDS: Readonly<Record<string, AcpToolKind>> = {
   bash: 'execute',
+  pwsh: 'execute',
+  run_code: 'execute',
+  terminal_open: 'execute',
+  terminal_send: 'execute',
+  terminal_signal: 'execute',
+  terminal_close: 'execute',
+  terminal_read: 'read',
+  terminal_list: 'read',
   read: 'read',
+  read_image: 'read',
   write: 'edit',
   edit: 'edit',
   multi_edit: 'edit',
+  str_replace_editor: 'edit',
   glob: 'search',
   grep: 'search',
+  lsp: 'search',
+  session_search: 'search',
+  session_event_search: 'search',
+  session_event_read: 'search',
+  session_event_trace: 'search',
+  session_trace: 'search',
   web_search: 'fetch',
   web_fetch: 'fetch',
   skill: 'think',
   todo_write: 'think',
+  ask_user_question: 'think',
+  exit_plan_mode: 'think',
   subagent: 'think',
   subagent_fork: 'think',
   workflow: 'think',
+  send_message: 'think',
+  interrupt_agent: 'think',
+  list_agents: 'think',
+  list_subagent_models: 'think',
+  followup_task: 'think',
+  spawn_teammate: 'think',
+  wait_agent: 'think',
+  job_list: 'think',
+  job_output: 'think',
+  job_kill: 'think',
+  create_goal: 'think',
+  get_goal: 'think',
+  update_goal: 'think',
+  ralph: 'think',
+  schedule_create: 'think',
+  schedule_list: 'think',
+  schedule_delete: 'think',
+  team_task_create: 'think',
+  team_task_get: 'think',
+  team_task_list: 'think',
+  team_task_update: 'think',
 }
 
 /**
@@ -71,22 +111,108 @@ export const titleOf = (name: string, args: unknown): string => {
     }
     return undefined
   }
+  /** The first line of a longer text, for a card that has one line. */
+  const firstLine = (...keys: string[]): string | undefined => {
+    const text = first(...keys)
+    if (text === undefined) return undefined
+    const line = text.split('\n').find((part) => part.trim().length > 0)?.trim()
+    return line !== undefined && line.length > 0 ? line : undefined
+  }
+  /** A string array joined for reading, as `web_search` now sends its queries. */
+  const list = (key: string): string | undefined => {
+    const value = args[key]
+    if (!Array.isArray(value)) return undefined
+    const parts = value.filter((part): part is string => typeof part === 'string' && part.length > 0)
+    return parts.length > 0 ? parts.join(', ') : undefined
+  }
   switch (name) {
     case 'bash':
+    case 'pwsh':
       return first('command') ?? name
+    case 'run_code':
+      return first('description') ?? firstLine('code') ?? name
     case 'read':
+    case 'read_image':
     case 'write':
     case 'edit':
     case 'multi_edit':
       return first('file_path', 'path') ?? name
+    case 'str_replace_editor': {
+      // The editor tool names its verb in `command` — view, create,
+      // str_replace, insert — and the file in `path`; both together is the
+      // sentence.
+      const path = first('path', 'file_path')
+      const command = first('command')
+      return path === undefined ? command ?? name : command === undefined ? path : `${command} ${path}`
+    }
     case 'glob':
     case 'grep':
       return first('pattern', 'query') ?? name
+    case 'lsp': {
+      const operation = first('operation')
+      const file = first('file_path')
+      return file === undefined ? operation ?? name : `${operation ?? 'lsp'} ${file}`
+    }
     case 'skill':
+    case 'spawn_teammate':
       return first('name') ?? name
     case 'web_search':
+      return list('queries') ?? first('query') ?? name
     case 'web_fetch':
-      return first('query', 'url') ?? name
+      return first('url', 'query') ?? name
+    case 'terminal_open':
+      return first('name', 'cwd') ?? name
+    case 'terminal_send':
+      return firstLine('text') ?? first('sessionId') ?? name
+    case 'terminal_read':
+    case 'terminal_close':
+    case 'terminal_list':
+      return first('sessionId') ?? name
+    case 'terminal_signal': {
+      const signal = first('signal')
+      const session = first('sessionId')
+      return signal === undefined ? session ?? name : session === undefined ? signal : `${signal} ${session}`
+    }
+    case 'send_message':
+    case 'followup_task': {
+      // The message body is the thing; the recipient names the row when the
+      // body is missing, and the tool's own name only when both are.
+      const target = first('agent_id', 'target')
+      const body = firstLine('message')
+      return body ?? (target === undefined ? name : `to ${target}`)
+    }
+    case 'interrupt_agent':
+      return first('agent_id', 'target') ?? name
+    case 'list_agents':
+      return first('scope') ?? name
+    case 'job_output':
+    case 'job_kill':
+      return first('job_id') ?? name
+    case 'ask_user_question': {
+      const questions = args['questions']
+      const one = Array.isArray(questions) ? questions.find(isRecord) : undefined
+      const question = one === undefined ? undefined : asString(one['question'])
+      return question !== undefined && question.length > 0 ? question : first('question') ?? name
+    }
+    case 'exit_plan_mode':
+      return firstLine('plan') ?? name
+    case 'create_goal':
+    case 'ralph':
+      return firstLine('objective') ?? name
+    case 'update_goal':
+      return first('action') ?? first('goal_id') ?? name
+    case 'schedule_create':
+      return firstLine('prompt') ?? name
+    case 'schedule_delete':
+      return first('id') ?? name
+    case 'session_search':
+    case 'session_event_search':
+      return first('query') ?? name
+    case 'team_task_create':
+      return first('subject') ?? name
+    case 'team_task_get':
+    case 'team_task_update':
+      return first('task_id') ?? name
     default:
       return first('description', 'title', 'name') ?? name
   }
@@ -140,11 +266,28 @@ export class SessionProjection {
    */
   readonly #replay: boolean
 
-  constructor(options: { readonly replay?: boolean } = {}) {
+  constructor(
+    options: {
+      readonly replay?: boolean
+      /**
+       * What an earlier fold of the same log already learned. A live record
+       * made for a reopened conversation starts from here, so the list keeps
+       * the title and the opening ask the stored row had instead of losing
+       * both the moment the conversation is opened.
+       */
+      readonly seed?: { readonly title?: string; readonly preview?: string }
+    } = {},
+  ) {
     this.#replay = options.replay ?? false
+    this.#title = options.seed?.title
+    this.#preview = options.seed?.preview
   }
 
   #title: string | undefined
+  /** The route the log last recorded; see {@link DshRoute}. */
+  #route: DshRoute | undefined
+  /** How the current turn ended, when it did not simply complete. */
+  #turnEnd: { readonly kind: 'error'; readonly message: string } | { readonly kind: 'max-tokens' } | undefined
   #contextWindow: number | undefined
   #lastContextUse = 0
   #sawUsage = false
@@ -171,6 +314,15 @@ export class SessionProjection {
 
   get title(): string | undefined {
     return this.#title
+  }
+
+  /**
+   * The provider, model and effort the conversation was last running on, in
+   * log order: a `model/selection` chosen for the next request, else the last
+   * request's own header. Undefined until the log has said.
+   */
+  get route(): DshRoute | undefined {
+    return this.#route
   }
 
   /** The context window the current route reports, once `request/context` has landed. */
@@ -200,6 +352,15 @@ export class SessionProjection {
         return this.#onTodoWrite(data)
       case 'user/message':
         return this.#onUserMessage(data)
+      case 'model/selection':
+        // A choice for the *next* request, written by a client that switched
+        // the route mid-conversation. Later in the log than the header of the
+        // request it applies to has not yet been assembled, so it wins.
+        this.#readRoute(data)
+        return []
+      case 'turn/end':
+        this.#onTurnEnd(data)
+        return []
       case 'session/title': {
         // ACP has no title update, so this is not projected onto the wire.
         // It is kept because `session/list` rows carry a title, and a client
@@ -217,7 +378,50 @@ export class SessionProjection {
     }
   }
 
+  /**
+   * Remember a route the log names. Effort is kept only when the record
+   * carries one: `request/context` names provider and model alone, and a
+   * missing effort there must not erase the one the header just recorded.
+   */
+  #readRoute(record: Record<string, unknown>): void {
+    const provider = asString(record['provider'])
+    const model = asString(record['model'])
+    if (provider === undefined || model === undefined || provider.length === 0 || model.length === 0) return
+    const effort = asString(record['reasoningEffort'])
+    const keptEffort =
+      this.#route?.provider === provider && this.#route.model === model ? this.#route.reasoningEffort : undefined
+    const reasoningEffort = effort ?? keptEffort
+    this.#route = { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
+  }
+
+  /**
+   * How a turn ended. The harness writes a structured reason: `completed`,
+   * `aborted`, `blocked`, `interrupted`, `max-tokens`, or `error` with the
+   * provider's own failure. A prompt that returned `end_turn` over an
+   * `error` reason told the client the model had answered when it had
+   * refused the key — an invalid API key produced a silent empty turn.
+   */
+  #onTurnEnd(data: Record<string, unknown>): void {
+    const reason = data['reason']
+    if (!isRecord(reason)) return
+    const kind = asString(reason['kind'])
+    if (kind === 'error') {
+      const error = isRecord(reason['error']) ? reason['error'] : {}
+      const code = asString(error['code'])
+      const message = asString(error['message']) ?? 'the model request failed'
+      this.#turnEnd = { kind: 'error', message: code === undefined ? message : `${message} (${code})` }
+    } else if (kind === 'max-tokens') {
+      this.#turnEnd = { kind: 'max-tokens' }
+    }
+  }
+
+  /** The turn's ending, when it was not a plain completion; cleared by `endTurn`. */
+  get turnEnd(): { readonly kind: 'error'; readonly message: string } | { readonly kind: 'max-tokens' } | undefined {
+    return this.#turnEnd
+  }
+
   #onRequestContext(data: Record<string, unknown>): AcpUpdate[] {
+    this.#readRoute(data)
     const size = asNumber(data['contextWindow'])
     if (size > 0) this.#contextWindow = size
     // A window that arrives after the first usage completes a fraction we
@@ -240,6 +444,9 @@ export class SessionProjection {
    */
   #onRequestHeader(data: Record<string, unknown>): AcpUpdate[] {
     const header = isRecord(data['header']) ? data['header'] : undefined
+    // The call config is the one record that carries the whole route, effort
+    // included; it is what a reopened conversation resumes on.
+    if (header !== undefined && isRecord(header['config'])) this.#readRoute(header['config'])
     const tools = header?.['tools']
     if (!Array.isArray(tools)) return []
     if (tools.length === this.#toolCount) return []
@@ -461,9 +668,32 @@ export class SessionProjection {
   #onUserMessage(data: Record<string, unknown>): AcpUpdate[] {
     const message = isRecord(data['message']) ? data['message'] : data
     const source = isRecord(message['source']) ? message['source'] : {}
+    const kind = source['kind']
+    // What another agent wrote into this conversation. rc.1 replaced the
+    // child's one-way `report` tool with `send_message`: a child's result
+    // arrives as a user-role message whose source is `agent-message`, and the
+    // runtime's own account of a child settling as `subagent-settled`. Both
+    // are what the parent read before it answered — dropping them leaves the
+    // parent visibly acting on words nobody was shown — and neither is the
+    // person, so they go out marked as a notice, live and on replay alike.
+    if (kind === 'agent-message' || kind === 'subagent-settled') {
+      const text = resultTextOf(message['content']).trim() || asString(source['summary'])?.trim() || ''
+      if (text.length === 0) return []
+      const sender = asString(source['senderSessionId'])
+      return [{
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text },
+        _meta: {
+          harnessdesk: {
+            notice: true,
+            from: { kind, ...(sender === undefined ? {} : { senderSessionId: sender }) },
+          },
+        },
+      }]
+    }
     // Tool results are user-role messages in the harness's model; they are
     // already rendered as tool cards and must not appear twice.
-    if (source['kind'] !== 'user') return []
+    if (kind !== 'user') return []
     const text = resultTextOf(message['content'])
     if (text.length === 0) return []
     // Remembered whether or not it is projected: a listed conversation with
@@ -501,6 +731,7 @@ export class SessionProjection {
 
   /** Forget the per-turn sums; the context fill and window survive the turn. */
   endTurn(): void {
+    this.#turnEnd = undefined
     this.#turn.input = 0
     this.#turn.output = 0
     this.#turn.cachedRead = 0

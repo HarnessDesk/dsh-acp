@@ -21,7 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
 import { createUserMessage, installModelSelection, sandboxModeAvailable, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
 import { SessionProjection } from './project.ts'
-import { sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
+import { EFFORTS, sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
 
 /**
@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.5.1'
+export const VERSION = '0.5.2'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -276,9 +276,13 @@ export function apply(
     return conn.requestPermission({
       sessionId,
       toolCall: { toolCallId: request.callId },
+      // No "always allow": the harness keeps no per-tool grant (its approval
+      // vocabulary is allow once, reject, cancel), so an option that promised
+      // one was answered as allow-once and asked again next time. A client
+      // that remembers grants — HarnessDesk's own policy layer does — remembers
+      // them before this question is ever asked.
       options: [
         { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-        { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
         { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
       ],
     } as never).then(({ outcome }): ApprovalOutcome => {
@@ -552,30 +556,39 @@ export function apply(
     // history in its per-turn token accumulator, so the first new
     // `PromptResponse.usage` would bill the conversation twice. Neither state
     // belongs to the live session.
-    let replayed: readonly AcpUpdate[] | undefined
-    if (options.replay) {
-      const history = new SessionProjection({ replay: true })
-      const updates: AcpUpdate[] = []
-      for (const event of stored.events) {
-        // One bad event is not a lost conversation: the log outlives this
-        // adapter's knowledge of it, and an unknown shape is skipped the same
-        // way the live feed skips one.
-        try {
-          updates.push(...history.onEvent(event as DshEvent))
-        } catch {
-          continue
-        }
+    //
+    // The fold runs whether or not the client asked for history, because it
+    // is also how this adapter learns three things the stored header does not
+    // carry: the route the conversation was running on, its title, and its
+    // opening ask. Only the updates are optional.
+    const history = new SessionProjection({ replay: true })
+    const updates: AcpUpdate[] = []
+    for (const event of stored.events) {
+      // One bad event is not a lost conversation: the log outlives this
+      // adapter's knowledge of it, and an unknown shape is skipped the same
+      // way the live feed skips one.
+      try {
+        updates.push(...history.onEvent(event as DshEvent))
+      } catch {
+        continue
       }
-      replayed = updates
     }
+    const replayed: readonly AcpUpdate[] | undefined = options.replay ? updates : undefined
 
     // The same coupling a fresh session gets. Without it a reopened
     // conversation advertised model and effort and then refused every choice
     // with "this harness composition fixes the route at startup" — a control
     // that is broken only after being reopened is worse than one that is
     // never offered.
+    //
+    // The route comes from the log first. The stored header never carried
+    // one (rc.1's `SessionHeader` has no provider or model), so until this
+    // fold every reopened conversation silently continued on whatever this
+    // deployment defaulted to — a conversation had on `deepseek-v4-pro`
+    // answered its next question as `deepseek-v4-flash` and said nothing.
+    const route = history.route
     const selection: ModelSelectionRef = {
-      current: routeOf(stored.meta) ?? defaultRoute(config),
+      current: route ?? routeOf(stored.meta) ?? defaultRoute(config),
       assembled: undefined,
     }
     let coupled = false
@@ -589,12 +602,32 @@ export function apply(
         ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
         : {}),
     })
+    // The pickers show what the conversation is actually on, so a person who
+    // chose Flash yesterday sees Flash today rather than the deployment's
+    // default drawn over an agent answering as Flash. Only a value the picker
+    // offers is remembered: an unknown one would draw a choice nobody can
+    // re-select.
+    const chosen = new Map<string, string>()
+    if (coupled && route !== undefined) {
+      if ((config.models ?? []).includes(route.model)) chosen.set('model', route.model)
+      const efforts = config.efforts ?? EFFORTS
+      const effort = route.reasoningEffort ?? 'off'
+      if (efforts.includes(effort)) chosen.set('effort', effort)
+    }
     const record: Record_ = {
       agent: handle.agent,
       cwd,
-      projection: new SessionProjection(),
+      // Seeded from the fold, so the list row keeps its title and preview
+      // across the reopen instead of dropping both for "hello again".
+      projection: new SessionProjection({
+        seed: {
+          ...(history.title === undefined ? {} : { title: history.title }),
+          ...(history.preview === undefined ? {} : { preview: history.preview }),
+        },
+      }),
+      ...(history.preview === undefined ? {} : { preview: history.preview }),
       updatedAt: Date.now(),
-      chosen: new Map(),
+      chosen,
       ...(coupled ? { selection } : {}),
       dispose: () => handle.dispose(),
       ...(replayed !== undefined ? { replayed } : {}),
@@ -716,8 +749,18 @@ export function apply(
           })
         })
         const usage = record.projection.promptUsage()
+        const ended = record.projection.turnEnd
         record.projection.endTurn()
-        return { stopReason, ...(usage !== undefined ? { usage } : {}) }
+        // A turn the harness ended on a provider failure is reported as one,
+        // not as `end_turn`: the client draws a failed turn with the reason
+        // where it drew a finished turn with nothing in it. An invalid key
+        // answered "Authentication Fails" into the log and nothing on the
+        // wire until this read the reason.
+        if (ended?.kind === 'error' && stopReason !== 'cancelled') {
+          throw internalError(`the model request failed: ${ended.message}`)
+        }
+        const reason = ended?.kind === 'max-tokens' ? 'max_tokens' : stopReason
+        return { stopReason: reason, ...(usage !== undefined ? { usage } : {}) }
       },
 
       /**

@@ -1,6 +1,6 @@
 {
   "name": "@harnessdesk/dsh-acp",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "A complete Agent Client Protocol server for DeepSeek Harness \u2014 streams reasoning, tool calls, plans, and token usage that the harness's own automation bridge withholds.",
   "keywords": [
     "acp",
@@ -42,7 +42,8 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "profile"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

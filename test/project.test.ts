@@ -417,3 +417,182 @@ describe('session title', () => {
     expect(projection.title!.length).toBeGreaterThan(0)
   })
 })
+
+describe('the route a conversation runs on', () => {
+  it('is undefined until the log has said', () => {
+    expect(new SessionProjection().route).toBeUndefined()
+  })
+
+  it('is read off the request header, effort included', () => {
+    const projection = new SessionProjection()
+    for (const event of eventsOf('request/header')) projection.onEvent(event)
+    // The recorded header names the whole route; the stored session header
+    // names none of it, which is why a reopened conversation folds its log.
+    expect(projection.route).toEqual({ provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'max' })
+  })
+
+  it('keeps the effort when request/context repeats the same route without one', () => {
+    const projection = new SessionProjection()
+    for (const event of eventsOf('request/header')) projection.onEvent(event)
+    for (const event of eventsOf('request/context')) projection.onEvent(event)
+    expect(projection.route?.reasoningEffort).toBe('max')
+  })
+
+  it('drops the effort when the route itself changes', () => {
+    const projection = new SessionProjection()
+    for (const event of eventsOf('request/header')) projection.onEvent(event)
+    projection.onEvent({ type: 'request/context', data: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } })
+    expect(projection.route).toEqual({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
+  })
+
+  it('lets a later model/selection win, because it names the next request', () => {
+    const projection = new SessionProjection()
+    for (const event of eventsOf('request/header')) projection.onEvent(event)
+    projection.onEvent({
+      type: 'model/selection',
+      data: { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' },
+    })
+    expect(projection.route).toEqual({ provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
+  })
+
+  it('ignores a record that names half a route', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'request/context', data: { provider: 'deepseek-official' } })
+    expect(projection.route).toBeUndefined()
+  })
+})
+
+describe('a projection seeded from an earlier fold', () => {
+  it('starts with the title and the opening ask the stored row had', () => {
+    const projection = new SessionProjection({ seed: { title: 'Snake in the terminal', preview: 'write me snake' } })
+    expect(projection.title).toBe('Snake in the terminal')
+    expect(projection.preview).toBe('write me snake')
+  })
+
+  it('still takes a later title from the harness', () => {
+    const projection = new SessionProjection({ seed: { title: 'first prompt' } })
+    projection.onEvent({ type: 'session/title', data: { title: 'A better name' } })
+    expect(projection.title).toBe('A better name')
+  })
+})
+
+describe('what another agent wrote into the conversation', () => {
+  const relay: DshEvent = {
+    type: 'user/message',
+    data: {
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Agent child-1 sent a message:' }, { type: 'text', text: 'Tests pass on the branch.' }],
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: 'child-1' },
+      },
+    },
+  }
+  const settled: DshEvent = {
+    type: 'user/message',
+    data: {
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Background subagent child-1 finished and will do no further work unless you send it more.' }],
+        source: {
+          kind: 'subagent-settled',
+          form: 'notice',
+          summary: 'Background subagent child-1 finished and will do no further work unless you send it more.',
+          senderSessionId: 'child-1',
+        },
+      },
+    },
+  }
+
+  it('sends a child\'s report as a notice, live, so the parent is not seen answering nothing', () => {
+    const [update] = new SessionProjection().onEvent(relay)
+    expect(update?.sessionUpdate).toBe('user_message_chunk')
+    const meta = (update as { _meta?: { harnessdesk?: { notice?: true; from?: { kind: string; senderSessionId?: string } } } })._meta
+    expect(meta?.harnessdesk?.notice).toBe(true)
+    expect(meta?.harnessdesk?.from).toEqual({ kind: 'agent-message', senderSessionId: 'child-1' })
+    expect((update as { content: { text: string } }).content.text).toContain('Tests pass on the branch.')
+  })
+
+  it('sends the runtime\'s account of a child settling the same way', () => {
+    const [update] = new SessionProjection({ replay: true }).onEvent(settled)
+    expect(update?.sessionUpdate).toBe('user_message_chunk')
+    const meta = (update as { _meta?: { harnessdesk?: { from?: { kind: string } } } })._meta
+    expect(meta?.harnessdesk?.from?.kind).toBe('subagent-settled')
+    expect((update as { content: { text: string } }).content.text).toMatch(/^Background subagent child-1 finished/)
+  })
+
+  it('never lets one become the opening ask of the conversation', () => {
+    const projection = new SessionProjection()
+    projection.onEvent(relay)
+    expect(projection.preview).toBeUndefined()
+  })
+
+  it('leaves a person\'s own message unmarked', () => {
+    const [update] = new SessionProjection({ replay: true }).onEvent({
+      type: 'user/message',
+      data: { message: { role: 'user', content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } } },
+    })
+    expect((update as { _meta?: unknown })._meta).toBeUndefined()
+  })
+})
+
+describe('sentences for the rc.1 tool catalog', () => {
+  it('reads a web search by its queries, which rc.1 sends as a list', () => {
+    expect(titleOf('web_search', { queries: ['deepseek harness acp', 'zed acp'] })).toBe('deepseek harness acp, zed acp')
+  })
+
+  it('reads the editor tool as its verb and its file', () => {
+    expect(titleOf('str_replace_editor', { command: 'view', path: 'src/index.ts' })).toBe('view src/index.ts')
+  })
+
+  it('reads what was typed into a terminal', () => {
+    expect(titleOf('terminal_send', { sessionId: 't1', text: 'npm test\n', submit: true })).toBe('npm test')
+  })
+
+  it('reads a message to another agent by its first line', () => {
+    expect(titleOf('send_message', { agent_id: 'parent', message: 'Done.\nDetails follow.' })).toBe('Done.')
+    expect(titleOf('send_message', { agent_id: 'parent' })).toBe('to parent')
+  })
+
+  it('reads a question by the question', () => {
+    expect(titleOf('ask_user_question', { questions: [{ question: 'Which branch?', options: [] }] })).toBe('Which branch?')
+  })
+
+  it('reads an lsp call as the operation on the file', () => {
+    expect(titleOf('lsp', { operation: 'definition', file_path: 'a.ts', line: 1, character: 2 })).toBe('definition a.ts')
+  })
+
+  it('still falls back to the tool name rather than JSON', () => {
+    expect(titleOf('terminal_list', {})).toBe('terminal_list')
+    expect(titleOf('cordis_run', { pluginId: 'p' })).toBe('cordis_run')
+  })
+})
+
+describe('how a turn ended', () => {
+  it('is nothing for a turn that simply completed', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    expect(projection.turnEnd).toBeUndefined()
+  })
+
+  it('keeps the provider failure the harness wrote, code included', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({
+      type: 'turn/end',
+      data: { turn: 1, reason: { kind: 'error', error: { message: 'Authentication Fails', code: 'AUTH', status: 401 } } },
+    })
+    expect(projection.turnEnd).toEqual({ kind: 'error', message: 'Authentication Fails (AUTH)' })
+  })
+
+  it('notes a turn cut off by the output limit', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'max-tokens' } } })
+    expect(projection.turnEnd).toEqual({ kind: 'max-tokens' })
+  })
+
+  it('is forgotten with the turn', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'max-tokens' } } })
+    projection.endTurn()
+    expect(projection.turnEnd).toBeUndefined()
+  })
+})
