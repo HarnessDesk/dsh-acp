@@ -88,6 +88,22 @@ export interface DshRequestContext {
   readonly contextWindow?: number
 }
 
+/**
+ * The route a conversation runs on, as its own log records it.
+ *
+ * Three events carry it: `request/header` (the whole call config, effort
+ * included), `request/context` (provider and model, logged when the route or
+ * capacity changes) and `model/selection` (a choice for the *next* request).
+ * The stored session header carries none of it — rc.1's `SessionHeader` has
+ * no provider or model — so a reopened conversation can only learn what it
+ * was running on by folding its log.
+ */
+export interface DshRoute {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
 /** ACP content blocks, narrowed to what this adapter produces. */
 export type AcpContent =
   | { readonly type: 'text'; readonly text: string }
@@ -108,7 +124,11 @@ export type AcpPlanStatus = 'pending' | 'in_progress' | 'completed'
 export type AcpUpdate =
   | { readonly sessionUpdate: 'agent_message_chunk'; readonly content: AcpContent }
   | { readonly sessionUpdate: 'agent_thought_chunk'; readonly content: AcpContent }
-  | { readonly sessionUpdate: 'user_message_chunk'; readonly content: AcpContent }
+  | {
+      readonly sessionUpdate: 'user_message_chunk'
+      readonly content: AcpContent
+      readonly _meta?: AcpUpdateMeta
+    }
   | {
       readonly sessionUpdate: 'tool_call'
       readonly toolCallId: string
@@ -177,7 +197,27 @@ export interface AcpContextBreakdown {
 export interface AcpUpdateMeta {
   readonly harnessdesk?: {
     readonly contextBreakdown?: AcpContextBreakdown
+    /**
+     * This user-role chunk is the agent's own housekeeping, not the person
+     * speaking: a client draws it as a notice on the turn rather than as a
+     * message from the user. The key HarnessDesk's bridges already use.
+     */
+    readonly notice?: true
+    /** Who wrote a notice that another agent sent, when the log says. */
+    readonly from?: AcpMessageFrom
   }
+}
+
+/**
+ * Attribution for a message the harness wrote into a conversation on another
+ * agent's behalf — a child reporting back over `send_message`, or the runtime
+ * saying what became of a child. Both are user-role in the harness's model
+ * and neither is the person; a transcript that showed them as the user's own
+ * words would put another agent's report in the person's mouth.
+ */
+export interface AcpMessageFrom {
+  readonly kind: 'agent-message' | 'subagent-settled'
+  readonly senderSessionId?: string
 }
 
 /** The per-turn totals ACP returns on `PromptResponse.usage`. */

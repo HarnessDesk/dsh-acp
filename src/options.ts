@@ -72,6 +72,29 @@ export interface ControlSupport {
   readonly mode?: boolean
 }
 
+/**
+ * What the pickers should already show for a reopened conversation: the
+ * route its own log recorded, where this composition offers it.
+ *
+ * Only a value the picker offers is remembered — an unknown one would draw a
+ * choice nobody can re-select — and only an effort the log actually names: a
+ * conversation that ran on the route's own default has none recorded, and
+ * writing `off` for it would turn thinking off on the next step.
+ */
+export const chosenForRoute = (
+  route: { readonly model: string; readonly reasoningEffort?: string } | undefined,
+  config: AdapterConfig,
+): Map<string, string> => {
+  const chosen = new Map<string, string>()
+  if (route === undefined) return chosen
+  if ((config.models ?? []).includes(route.model)) chosen.set('model', route.model)
+  const efforts = config.efforts ?? EFFORTS
+  if (route.reasoningEffort !== undefined && efforts.includes(route.reasoningEffort)) {
+    chosen.set('effort', route.reasoningEffort)
+  }
+  return chosen
+}
+
 export const sessionConfigOptions = (
   config: AdapterConfig,
   /**

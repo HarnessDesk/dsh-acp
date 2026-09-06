@@ -24,19 +24,30 @@ context-usage indicator.
 This adapter makes the opposite choice. Same harness, same session, everything on
 the wire.
 
-| | `@deepseek-ai/dsh-acp` | this |
+Upstream has moved since that paragraph was written. From DeepSeek Harness
+`0.1.2-alpha.1` (commit `511181684c`, 2026-08-22) its own server streams
+reasoning, tool calls and `usage_update`, and takes model and reasoning effort
+as `configOptions`; its README still says it is "built for automation… rather
+than the DSH user interface", and its Known Limitations still refuse the verbs
+a person needs. Measured against `v0.1.2-rc.1`:
+
+| | `@deepseek-ai/dsh-acp` (rc.1) | this |
 |---|---|---|
 | Assistant text | ✅ committed messages | ✅ streamed |
-| Reasoning | — | ✅ `agent_thought_chunk` |
-| Tool calls | — | ✅ `tool_call` / `tool_call_update`, with output |
+| Reasoning | ✅ `agent_thought_chunk` | ✅ `agent_thought_chunk` |
+| Tool calls | ✅ generic lifecycle | ✅ `tool_call` / `tool_call_update`, with output and a sentence per rc.1 tool |
 | Plans (`todo_write`) | — | ✅ `plan` |
-| Token usage | — | ✅ `usage_update` + `PromptResponse.usage` |
+| Token usage | ✅ `usage_update` only | ✅ `usage_update` + `PromptResponse.usage` (turn totals, cache reads and writes) |
 | Context composition | — | ✅ system / tools / messages, from the harness's own meter |
-| Model / effort / sandbox mode | — | ✅ ACP `configOptions` |
-| Conversation list | ✅ `session/list` (stored) | ✅ live **and** stored, with the harness's own titles |
-| Reopen a conversation | ✅ `session/resume` | ✅ `session/resume` |
+| Model / effort | ✅ `session/set_config_option` | ✅ ACP `configOptions` |
+| Sandbox mode | — | ✅ ACP `configOptions` (`mode`) |
+| MCP servers on `session/new` | ✅ stdio + HTTP | — refused, out loud (see below) |
+| Image prompts | ✅ with an attachment store | — |
+| Conversation list | ✅ `session/list` (stored, paged) | ✅ live **and** stored, with the harness's own titles |
+| Reopen a conversation | ✅ `session/resume` | ✅ `session/resume` — on the model it was having |
 | …and see what it said | — `session/load` refused | ✅ `session/load` replays the whole log |
-| Permission prompts | ✅ allow / reject | ✅ + allow-always |
+| What another agent wrote | — | ✅ `send_message` relays and settlement notices, attributed |
+| Permission prompts | ✅ allow / reject | ✅ allow / reject |
 
 ### What counts as a conversation
 
@@ -280,9 +291,27 @@ gets the ring.
 
 ## Status
 
-Working and tested end to end against a real harness: streaming, reasoning, tool
-calls with output, plans, usage, permission prompts, the three session controls, and
-a conversation list carrying the harness's own session titles.
+Working and tested end to end against a real harness — most recently
+`v0.1.2-rc.1`, built from source and driven over stdio: streaming, reasoning,
+tool calls with output, plans, usage, permission prompts, the three session
+controls, a conversation list carrying the harness's own session titles,
+`session/load` with replay, and `session/set_config_option` for model, effort
+and sandbox mode. rc.1's removals — `Session.events`, the SQLite persistence
+backend, `APIProxy` — touch nothing this adapter injects.
+
+A reopened conversation continues on the route its own log last recorded
+(`request/header`'s call config, or a later `model/selection`), never on the
+deployment's default: the stored session header carries no provider or model,
+so the log is the only place the answer lives. The pickers show that route.
+
+Since rc.1 a child reports back over `send_message` instead of the one-way
+`report` tool, and the runtime writes its own one-line account when a child
+settles. Both arrive in the parent's log as user-role messages whose source is
+`agent-message` or `subagent-settled`; this adapter sends them as
+`user_message_chunk` marked `_meta.harnessdesk.notice: true` with a `from`
+naming the sender, so a client draws them as notices on the turn rather than
+as the person's words — and neither counts as the person speaking for the
+conversation list.
 
 A listed conversation only has a name if the composition generates one. The title
 service and its provider are separate plugins, and mounting them is what turns a row
@@ -311,12 +340,6 @@ with a cwd and a preview, and `title` is `null`.
 
 Not implemented yet:
 
-- `session/load` — the capability is advertised as `false` rather than being claimed
-  and then failing. Because of this, `session/list` reports the conversations this
-  process is holding rather than reading the harness's persisted store, so a
-  conversation does not yet survive a restart.
-- Live `session/set_model` and `session/set_config_option`; the options are reported,
-  but changing one mid-session is not wired.
 - **MCP server pass-through — refused, out loud.** The harness does host MCP
   servers, through `@deepseek-ai/dsh-mcp-client`, but it connects them at
   composition time: one plugin instance per server in `cordis.yml`. Nothing on
@@ -330,6 +353,24 @@ Not implemented yet:
   only symptom was an agent that said it could not do something it had been
   told it could. A refusal naming `mcpServers` is the one answer a client can
   act on: it retries without the server and reports which tools are missing.
+
+## Running it on DeepSeek Harness 0.1.2-rc.1
+
+rc.1 removed `packages/examples`, and with it the `dsh-agent-spine-demo` the
+older compositions mounted. The short route now is the shipped `acp` profile
+with an overlay — [`profile/harnessdesk.patch.yml`](profile/harnessdesk.patch.yml)
+— that switches the harness's own server off and puts this one on the stdio:
+
+```sh
+ln -s "$(pwd)" "$DSH_HOME/profiles/acp/node_modules/@harnessdesk/dsh-acp"
+NODE_PATH="$DSH_HOME/profiles/node_modules" dsh --profile acp --patch profile/harnessdesk.patch.yml
+```
+
+`NODE_PATH` matters: the adapter reaches the harness's own packages for the
+model-selection coupling through it, and without it the model and reasoning
+pickers are honestly withheld. The base bundle mounts everything else this
+adapter reads — persistence, titles, the token meter, the session
+projections.
 
 ## Development
 

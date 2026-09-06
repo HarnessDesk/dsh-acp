@@ -1,0 +1,23 @@
+# HarnessDesk's ACP server over DeepSeek Harness's shipped `acp` profile.
+#
+# The base bundle already mounts the agent loop, the session store, titles,
+# the token meter and the session projections; this overlay switches off the
+# harness's own automation-only server and puts this one on the stdio.
+#
+#   ln -s <this checkout> $DSH_HOME/profiles/acp/node_modules/@harnessdesk/dsh-acp
+#   NODE_PATH=$DSH_HOME/profiles/node_modules dsh --profile acp --patch profile/harnessdesk.patch.yml
+#
+# Driven end to end against DeepSeek Harness 0.1.2-rc.1 on 2026-09-05.
+- id: acp
+  disabled: true
+- id: acp-app-startup
+  disabled: true
+- insert:
+    - id: harnessdesk-acp
+      name: '@harnessdesk/dsh-acp'
+      config:
+        provider: deepseek-official
+        model: deepseek-v4-flash
+        models:
+          - deepseek-v4-flash
+          - deepseek-v4-pro

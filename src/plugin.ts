@@ -20,8 +20,8 @@ import {
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
 import { createUserMessage, installModelSelection, sandboxModeAvailable, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
-import { SessionProjection } from './project.ts'
-import { sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
+import { newerTitle, SessionProjection, stopReasonFor } from './project.ts'
+import { chosenForRoute, sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
 
 /**
@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.5.1'
+export const VERSION = '0.5.2'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
@@ -68,6 +68,8 @@ const invalidParams = (detail: string): RequestError =>
 /** What one fold over a stored log can say about it without opening it. */
 interface StoredDescription {
   title: string | null
+  /** Log position of the title event, so two folds can be compared. */
+  titleSeq: number | null
   preview: string | null
   /** Epoch ms of the newest event, or null when nothing carried a time. */
   lastActivityAt: number | null
@@ -276,9 +278,13 @@ export function apply(
     return conn.requestPermission({
       sessionId,
       toolCall: { toolCallId: request.callId },
+      // No "always allow": the harness keeps no per-tool grant (its approval
+      // vocabulary is allow once, reject, cancel), so an option that promised
+      // one was answered as allow-once and asked again next time. A client
+      // that remembers grants — HarnessDesk's own policy layer does — remembers
+      // them before this question is ever asked.
       options: [
         { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-        { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
         { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
       ],
     } as never).then(({ outcome }): ApprovalOutcome => {
@@ -355,6 +361,7 @@ export function apply(
     if (known !== undefined && known.revision === revision) return known.described
     const found: StoredDescription = {
       title: null,
+      titleSeq: null,
       preview: null,
       lastActivityAt: null,
       read: false,
@@ -378,6 +385,7 @@ export function apply(
         }
       }
       found.title = projection.title ?? null
+      found.titleSeq = projection.titleSeq ?? null
       found.preview = projection.preview ?? null
     } catch {
       // A log this harness refuses is still a row; it simply has no name.
@@ -552,49 +560,79 @@ export function apply(
     // history in its per-turn token accumulator, so the first new
     // `PromptResponse.usage` would bill the conversation twice. Neither state
     // belongs to the live session.
-    let replayed: readonly AcpUpdate[] | undefined
-    if (options.replay) {
-      const history = new SessionProjection({ replay: true })
-      const updates: AcpUpdate[] = []
-      for (const event of stored.events) {
-        // One bad event is not a lost conversation: the log outlives this
-        // adapter's knowledge of it, and an unknown shape is skipped the same
-        // way the live feed skips one.
-        try {
-          updates.push(...history.onEvent(event as DshEvent))
-        } catch {
-          continue
-        }
+    //
+    // The fold runs whether or not the client asked for history, because it
+    // is also how this adapter learns three things the stored header does not
+    // carry: the route the conversation was running on, its title, and its
+    // opening ask. Only the updates are optional.
+    const history = new SessionProjection({ replay: true })
+    const updates: AcpUpdate[] = []
+    for (const event of stored.events) {
+      // One bad event is not a lost conversation: the log outlives this
+      // adapter's knowledge of it, and an unknown shape is skipped the same
+      // way the live feed skips one.
+      try {
+        updates.push(...history.onEvent(event as DshEvent))
+      } catch {
+        continue
       }
-      replayed = updates
     }
+    const replayed: readonly AcpUpdate[] | undefined = options.replay ? updates : undefined
 
     // The same coupling a fresh session gets. Without it a reopened
     // conversation advertised model and effort and then refused every choice
     // with "this harness composition fixes the route at startup" — a control
     // that is broken only after being reopened is worse than one that is
     // never offered.
+    //
+    // The route comes from the log first. The stored header never carried
+    // one (rc.1's `SessionHeader` has no provider or model), so until this
+    // fold every reopened conversation silently continued on whatever this
+    // deployment defaulted to — a conversation had on `deepseek-v4-pro`
+    // answered its next question as `deepseek-v4-flash` and said nothing.
+    const route = history.route
     const selection: ModelSelectionRef = {
-      current: routeOf(stored.meta) ?? defaultRoute(config),
+      current: route ?? routeOf(stored.meta) ?? defaultRoute(config),
       assembled: undefined,
     }
     let coupled = false
+    // The agent's own options name the folded route too, not only the
+    // configured one: a composition that cannot couple a model selection
+    // resumes on whatever `agentOptions` said, and saying the config default
+    // there put a v4-pro conversation back on flash the moment coupling was
+    // unavailable. (Cursor's review of #5.)
+    const resumeRoute = selection.current
     const handle = await ctx.agents.resume({
       resumeSessionId: sessionId,
       meta: { cwd },
       setup: async (agentCtx) => {
         coupled = await installModelSelection(agentCtx, selection)
       },
-      ...(config.provider !== undefined || config.model !== undefined
-        ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
+      ...(resumeRoute !== undefined
+        ? { agentOptions: { provider: resumeRoute.provider, model: resumeRoute.model } }
         : {}),
     })
+    // The pickers show what the conversation is actually on, so a person who
+    // chose Flash yesterday sees Flash today rather than the deployment's
+    // default drawn over an agent answering as Flash. Only a value the picker
+    // offers is remembered: an unknown one would draw a choice nobody can
+    // re-select.
+    const chosen = coupled ? chosenForRoute(route, config) : new Map<string, string>()
     const record: Record_ = {
       agent: handle.agent,
       cwd,
-      projection: new SessionProjection(),
+      // Seeded from the fold, so the list row keeps its title and preview
+      // across the reopen instead of dropping both for "hello again".
+      projection: new SessionProjection({
+        seed: {
+          ...(history.title === undefined ? {} : { title: history.title }),
+          ...(history.titleSeq === undefined ? {} : { titleSeq: history.titleSeq }),
+          ...(history.preview === undefined ? {} : { preview: history.preview }),
+        },
+      }),
+      ...(history.preview === undefined ? {} : { preview: history.preview }),
       updatedAt: Date.now(),
-      chosen: new Map(),
+      chosen,
       ...(coupled ? { selection } : {}),
       dispose: () => handle.dispose(),
       ...(replayed !== undefined ? { replayed } : {}),
@@ -702,6 +740,10 @@ export function apply(
         record.preview ??= text.trim().slice(0, 200)
         record.updatedAt = Date.now()
         record.cancelled = false
+        // The previous turn's ending belongs to the previous turn. It is
+        // cleared when a prompt settles, but a turn that never settled would
+        // otherwise hand its error to the next one.
+        record.projection.endTurn()
         const message = await createUserMessage(text)
         const stopReason = await new Promise<string>((resolve, reject) => {
           record.inflight = { resolve, reject }
@@ -716,8 +758,22 @@ export function apply(
           })
         })
         const usage = record.projection.promptUsage()
+        const ended = record.projection.turnEnd
         record.projection.endTurn()
-        return { stopReason, ...(usage !== undefined ? { usage } : {}) }
+        // A turn the harness ended on a provider failure is reported as one,
+        // not as `end_turn`: the client draws a failed turn with the reason
+        // where it drew a finished turn with nothing in it. An invalid key
+        // answered "Authentication Fails" into the log and nothing on the
+        // wire until this read the reason.
+        if (ended?.kind === 'error' && stopReason !== 'cancelled') {
+          throw internalError(`the model request failed: ${ended.message}`)
+        }
+        // A stop the person asked for is reported as one whatever the log
+        // says the turn ended on; only an uncancelled turn that ran out of
+        // room reads as `max_tokens`. (Codex's review of #5 caught the
+        // ordering: the cancelled case was preserved for errors and then
+        // overwritten here.)
+        return { stopReason: stopReasonFor(stopReason, ended), ...(usage !== undefined ? { usage } : {}) }
       },
 
       /**
@@ -806,6 +862,7 @@ export function apply(
           preview: string | null
           updatedAt: string
           sortAt: number
+          titleSeq?: number
         }>()
         if (store !== undefined) {
           // Snapshots where the backend has them, because they carry the
@@ -842,7 +899,7 @@ export function apply(
           for (const [index, header] of stored.entries()) {
             const describe =
               named[index] ??
-              ({ title: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
+              ({ title: null, titleSeq: null, preview: null, lastActivityAt: null, read: false, spoken: false } as StoredDescription)
             // Hidden only when the log was actually read *and* held no user
             // message. A log that could not be parsed, or one past the fold
             // budget, is listed — a row nothing has inspected is not a row
@@ -860,6 +917,7 @@ export function apply(
               sessionId: header.id,
               cwd: header.cwd as string,
               title: describe.title,
+              ...(describe.titleSeq === null ? {} : { titleSeq: describe.titleSeq }),
               preview: describe.preview,
               updatedAt: new Date(at).toISOString(),
               sortAt: at,
@@ -868,11 +926,23 @@ export function apply(
         }
         for (const [sessionId, record] of sessions) {
           if (params.cwd !== undefined && record.cwd !== params.cwd) continue
+          // The name is whichever fold read it later in the log. The live
+          // feed has been seen to miss a `session/title` the titler wrote
+          // after the turn — the model-generated name that follows the
+          // word-count fallback — while the stored log, being the log, has
+          // it; and right after a title event the store may not have
+          // flushed it yet while the live feed has. Position in the log
+          // decides, never which fold.
+          const stored = rows.get(sessionId)
+          const title = newerTitle(
+            { title: stored?.title ?? null, seq: stored?.titleSeq },
+            { title: record.projection.title ?? null, seq: record.projection.titleSeq },
+          )
           rows.set(sessionId, {
             sessionId,
             cwd: record.cwd,
-            title: record.projection.title ?? null,
-            preview: record.preview ?? null,
+            title,
+            preview: record.preview ?? stored?.preview ?? null,
             updatedAt: new Date(record.updatedAt).toISOString(),
             sortAt: record.updatedAt,
           })

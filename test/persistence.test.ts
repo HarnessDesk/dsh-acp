@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 import { isRootConversation, isUserMessage } from '../src/plugin.ts'
-import { sessionConfigOptions } from '../src/options.ts'
+import { chosenForRoute, sessionConfigOptions } from '../src/options.ts'
 import { SessionProjection } from '../src/project.ts'
 import type { AcpUpdate, DshEvent } from '../src/types.ts'
 
@@ -278,5 +278,29 @@ describe('a session nobody spoke in is not a conversation', () => {
     expect(isUserMessage({ type: 'sandbox/mode', data: { mode: 'workspace-write' } })).toBe(false)
     expect(isUserMessage(null)).toBe(false)
     expect(isUserMessage('nonsense')).toBe(false)
+  })
+})
+
+describe('the pickers a reopened conversation comes back with', () => {
+  const config = { provider: 'deepseek-official', model: 'deepseek-v4-flash', models: ['deepseek-v4-flash', 'deepseek-v4-pro'] }
+
+  it('shows the model the log recorded, not the deployment default', () => {
+    const chosen = chosenForRoute({ model: 'deepseek-v4-pro' }, config)
+    expect(chosen.get('model')).toBe('deepseek-v4-pro')
+  })
+
+  it('records an effort only when the log names one', () => {
+    // A conversation that ran on the route's own default has none recorded;
+    // writing `off` for it would turn thinking off on the next step.
+    expect(chosenForRoute({ model: 'deepseek-v4-pro' }, config).has('effort')).toBe(false)
+    expect(chosenForRoute({ model: 'deepseek-v4-pro', reasoningEffort: 'low' }, config).get('effort')).toBe('low')
+  })
+
+  it('withholds a choice this composition does not offer', () => {
+    expect(chosenForRoute({ model: 'some-other-model', reasoningEffort: 'nonsense' }, config).size).toBe(0)
+  })
+
+  it('chooses nothing at all when the log named no route', () => {
+    expect(chosenForRoute(undefined, config).size).toBe(0)
   })
 })
