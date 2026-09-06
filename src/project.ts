@@ -218,6 +218,42 @@ export const titleOf = (name: string, args: unknown): string => {
   }
 }
 
+/**
+ * Which of two folds of one log names the conversation.
+ *
+ * The live feed and the stored log can disagree: the feed has been seen to
+ * miss a `session/title` the titler wrote after the turn, and right after a
+ * title event the store may not have flushed it yet. Position in the log
+ * decides — but only when both positions are known. A fold whose events
+ * carried no `seq` has no comparable position, and preferring the live fold
+ * there is the safer half of the trade: it is the one that is definitely
+ * still being appended to.
+ */
+export const newerTitle = (
+  stored: { readonly title?: string | null; readonly seq?: number | undefined },
+  live: { readonly title?: string | null; readonly seq?: number | undefined },
+): string | null => {
+  const storedTitle = stored.title ?? null
+  const liveTitle = live.title ?? null
+  if (storedTitle === null) return liveTitle
+  if (liveTitle === null) return storedTitle
+  const comparable = typeof stored.seq === 'number' && typeof live.seq === 'number'
+  return comparable && stored.seq! > live.seq! ? storedTitle : liveTitle
+}
+
+/**
+ * What a settled prompt reports.
+ *
+ * A stop the person asked for is reported as one whatever else the log says
+ * about the turn: cancelling as the provider reaches its output limit is
+ * still a cancellation, and reporting a model-imposed limit there tells the
+ * client its stop did not work.
+ */
+export const stopReasonFor = (
+  stopReason: string,
+  ended: { readonly kind: 'error' | 'max-tokens' } | undefined,
+): string => (stopReason === 'cancelled' ? 'cancelled' : ended?.kind === 'max-tokens' ? 'max_tokens' : stopReason)
+
 /** Harness todo statuses are already ACP's three; anything else is pending. */
 const planStatusOf = (status: unknown): AcpPlanStatus =>
   status === 'in_progress' || status === 'completed' ? status : 'pending'
@@ -382,7 +418,12 @@ export class SessionProjection {
         const title = asString(data['title'])?.trim()
         if (title !== undefined && title.length > 0) {
           this.#title = title
-          this.#titleSeq = typeof event.seq === 'number' ? event.seq : (this.#titleSeq ?? 0) + 1
+          // Only a position the log actually carries. A synthetic counter
+          // would be comparable with another fold's real `seq` while meaning
+          // something else entirely, and two folds of the same log would
+          // invent the same numbers — "higher wins" degenerating to "last
+          // fold wins". Unknown is a state; see `newerTitle`.
+          this.#titleSeq = typeof event.seq === 'number' ? event.seq : undefined
         }
         return []
       }
@@ -422,9 +463,16 @@ export class SessionProjection {
     if (!isRecord(reason)) return
     const kind = asString(reason['kind'])
     if (kind === 'error') {
+      // The harness writes a structured `LlmFailure`, but a backend that
+      // flattens its error to a string — or names it on the reason itself —
+      // must not lose the one sentence a person can act on.
       const error = isRecord(reason['error']) ? reason['error'] : {}
       const code = asString(error['code'])
-      const message = asString(error['message']) ?? 'the model request failed'
+      const message =
+        asString(error['message']) ??
+        asString(reason['error']) ??
+        asString(reason['message']) ??
+        'the model request failed'
       this.#turnEnd = { kind: 'error', message: code === undefined ? message : `${message} (${code})` }
     } else if (kind === 'max-tokens') {
       this.#turnEnd = { kind: 'max-tokens' }

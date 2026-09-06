@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { SessionProjection, titleOf } from '../src/project.ts'
+import { newerTitle, SessionProjection, stopReasonFor, titleOf } from '../src/project.ts'
 import type { AcpUpdate, DshEvent } from '../src/types.ts'
 
 const fixtures = JSON.parse(
@@ -610,5 +610,64 @@ describe('where a title came from in the log', () => {
   it('carries a seeded position through, so a reopened record does not lose it', () => {
     const projection = new SessionProjection({ seed: { title: 'A real name', titleSeq: 19 } })
     expect(projection.titleSeq).toBe(19)
+  })
+})
+
+describe('which fold names the conversation', () => {
+  it('takes the title read later in the log', () => {
+    expect(newerTitle({ title: 'A real name', seq: 19 }, { title: 'first words', seq: 7 })).toBe('A real name')
+    expect(newerTitle({ title: 'first words', seq: 7 }, { title: 'A real name', seq: 19 })).toBe('A real name')
+  })
+
+  it('prefers the live fold when the positions cannot be compared', () => {
+    // A fold whose events carried no `seq` has no comparable position, and
+    // the live one is the fold still being appended to.
+    expect(newerTitle({ title: 'stored', seq: 19 }, { title: 'live' })).toBe('live')
+    expect(newerTitle({ title: 'stored' }, { title: 'live', seq: 3 })).toBe('live')
+  })
+
+  it('takes whichever fold has a name at all', () => {
+    expect(newerTitle({ title: 'stored', seq: 2 }, { title: null })).toBe('stored')
+    expect(newerTitle({ title: null }, { title: 'live', seq: 2 })).toBe('live')
+    expect(newerTitle({ title: null }, { title: null })).toBeNull()
+  })
+})
+
+describe('what a settled prompt reports', () => {
+  it('reports a stop the person asked for, even when the turn also ran out of room', () => {
+    expect(stopReasonFor('cancelled', { kind: 'max-tokens' })).toBe('cancelled')
+    expect(stopReasonFor('cancelled', { kind: 'error' })).toBe('cancelled')
+  })
+
+  it('reports the output limit only for a turn nobody stopped', () => {
+    expect(stopReasonFor('end_turn', { kind: 'max-tokens' })).toBe('max_tokens')
+    expect(stopReasonFor('end_turn', undefined)).toBe('end_turn')
+  })
+})
+
+describe('a turn that ended on a string error', () => {
+  it('keeps the sentence a backend flattened onto the reason', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: 'Authentication Fails' } } })
+    expect(projection.turnEnd).toEqual({ kind: 'error', message: 'Authentication Fails' })
+  })
+
+  it('falls back to a message on the reason itself', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error', message: 'upstream refused' } } })
+    expect(projection.turnEnd).toEqual({ kind: 'error', message: 'upstream refused' })
+  })
+
+  it('still says something when the reason names nothing', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'turn/end', data: { turn: 1, reason: { kind: 'error' } } })
+    expect(projection.turnEnd).toEqual({ kind: 'error', message: 'the model request failed' })
+  })
+
+  it('records no position for a title event the log gave no seq', () => {
+    const projection = new SessionProjection()
+    projection.onEvent({ type: 'session/title', data: { title: 'no position' } })
+    expect(projection.title).toBe('no position')
+    expect(projection.titleSeq).toBeUndefined()
   })
 })

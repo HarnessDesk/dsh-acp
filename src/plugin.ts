@@ -20,8 +20,8 @@ import {
 import { randomUUID } from 'node:crypto'
 import { Readable, Writable } from 'node:stream'
 import { createUserMessage, installModelSelection, sandboxModeAvailable, setSandboxMode, stopAgent, userMessageFallbackReason, type ApprovalOutcome, type ApprovalRequest, type HarnessAgent, type HarnessContext, type HarnessPersistence, type HarnessPersistenceContext, type HarnessProjectionContext, type HarnessSession, type HarnessSessionHeader, type ModelSelectionRef } from './harness.ts'
-import { SessionProjection } from './project.ts'
-import { EFFORTS, sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
+import { newerTitle, SessionProjection, stopReasonFor } from './project.ts'
+import { chosenForRoute, sessionConfigOptions, type AdapterConfig, type ControlSupport } from './options.ts'
 import type { AcpUpdate, DshEvent } from './types.ts'
 
 /**
@@ -617,17 +617,7 @@ export function apply(
     // default drawn over an agent answering as Flash. Only a value the picker
     // offers is remembered: an unknown one would draw a choice nobody can
     // re-select.
-    const chosen = new Map<string, string>()
-    if (coupled && route !== undefined) {
-      if ((config.models ?? []).includes(route.model)) chosen.set('model', route.model)
-      // Only an effort the log actually names. A conversation that ran on the
-      // route's default effort has none recorded, and writing `off` for it
-      // would turn thinking off on the next step. (Cursor's review of #5.)
-      const efforts = config.efforts ?? EFFORTS
-      if (route.reasoningEffort !== undefined && efforts.includes(route.reasoningEffort)) {
-        chosen.set('effort', route.reasoningEffort)
-      }
-    }
+    const chosen = coupled ? chosenForRoute(route, config) : new Map<string, string>()
     const record: Record_ = {
       agent: handle.agent,
       cwd,
@@ -750,6 +740,10 @@ export function apply(
         record.preview ??= text.trim().slice(0, 200)
         record.updatedAt = Date.now()
         record.cancelled = false
+        // The previous turn's ending belongs to the previous turn. It is
+        // cleared when a prompt settles, but a turn that never settled would
+        // otherwise hand its error to the next one.
+        record.projection.endTurn()
         const message = await createUserMessage(text)
         const stopReason = await new Promise<string>((resolve, reject) => {
           record.inflight = { resolve, reject }
@@ -779,8 +773,7 @@ export function apply(
         // room reads as `max_tokens`. (Codex's review of #5 caught the
         // ordering: the cancelled case was preserved for errors and then
         // overwritten here.)
-        const reason = stopReason === 'cancelled' ? 'cancelled' : ended?.kind === 'max-tokens' ? 'max_tokens' : stopReason
-        return { stopReason: reason, ...(usage !== undefined ? { usage } : {}) }
+        return { stopReason: stopReasonFor(stopReason, ended), ...(usage !== undefined ? { usage } : {}) }
       },
 
       /**
@@ -941,10 +934,10 @@ export function apply(
           // flushed it yet while the live feed has. Position in the log
           // decides, never which fold.
           const stored = rows.get(sessionId)
-          const storedSeq = stored?.titleSeq ?? -1
-          const liveSeq = record.projection.titleSeq ?? -1
-          const title =
-            stored?.title != null && storedSeq > liveSeq ? stored.title : record.projection.title ?? stored?.title ?? null
+          const title = newerTitle(
+            { title: stored?.title ?? null, seq: stored?.titleSeq },
+            { title: record.projection.title ?? null, seq: record.projection.titleSeq },
+          )
           rows.set(sessionId, {
             sessionId,
             cwd: record.cwd,
