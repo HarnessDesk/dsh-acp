@@ -596,14 +596,20 @@ export function apply(
       assembled: undefined,
     }
     let coupled = false
+    // The agent's own options name the folded route too, not only the
+    // configured one: a composition that cannot couple a model selection
+    // resumes on whatever `agentOptions` said, and saying the config default
+    // there put a v4-pro conversation back on flash the moment coupling was
+    // unavailable. (Cursor's review of #5.)
+    const resumeRoute = selection.current
     const handle = await ctx.agents.resume({
       resumeSessionId: sessionId,
       meta: { cwd },
       setup: async (agentCtx) => {
         coupled = await installModelSelection(agentCtx, selection)
       },
-      ...(config.provider !== undefined || config.model !== undefined
-        ? { agentOptions: { ...(config.provider !== undefined ? { provider: config.provider } : {}), ...(config.model !== undefined ? { model: config.model } : {}) } }
+      ...(resumeRoute !== undefined
+        ? { agentOptions: { provider: resumeRoute.provider, model: resumeRoute.model } }
         : {}),
     })
     // The pickers show what the conversation is actually on, so a person who
@@ -614,9 +620,13 @@ export function apply(
     const chosen = new Map<string, string>()
     if (coupled && route !== undefined) {
       if ((config.models ?? []).includes(route.model)) chosen.set('model', route.model)
+      // Only an effort the log actually names. A conversation that ran on the
+      // route's default effort has none recorded, and writing `off` for it
+      // would turn thinking off on the next step. (Cursor's review of #5.)
       const efforts = config.efforts ?? EFFORTS
-      const effort = route.reasoningEffort ?? 'off'
-      if (efforts.includes(effort)) chosen.set('effort', effort)
+      if (route.reasoningEffort !== undefined && efforts.includes(route.reasoningEffort)) {
+        chosen.set('effort', route.reasoningEffort)
+      }
     }
     const record: Record_ = {
       agent: handle.agent,
@@ -764,7 +774,12 @@ export function apply(
         if (ended?.kind === 'error' && stopReason !== 'cancelled') {
           throw internalError(`the model request failed: ${ended.message}`)
         }
-        const reason = ended?.kind === 'max-tokens' ? 'max_tokens' : stopReason
+        // A stop the person asked for is reported as one whatever the log
+        // says the turn ended on; only an uncancelled turn that ran out of
+        // room reads as `max_tokens`. (Codex's review of #5 caught the
+        // ordering: the cancelled case was preserved for errors and then
+        // overwritten here.)
+        const reason = stopReason === 'cancelled' ? 'cancelled' : ended?.kind === 'max-tokens' ? 'max_tokens' : stopReason
         return { stopReason: reason, ...(usage !== undefined ? { usage } : {}) }
       },
 
