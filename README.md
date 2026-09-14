@@ -158,8 +158,31 @@ Mount the plugin in a harness composition, alongside an agent spine:
   config:
     provider: deepseek-official
     model: deepseek-v4-pro
-    models: [deepseek-v4-pro, deepseek-v4-flash]
+    models: [deepseek-flash, deepseek-v4-pro]
 ```
+
+New sessions use DeepSeek's current `deepseek-flash` route, displayed as
+**DeepSeek V4.1 Flash**, beside **DeepSeek V4 Pro**. The legacy
+`deepseek-v4-flash` identifier remains readable in historical session logs but
+is not advertised as a new-session choice.
+
+### Official ACP compatibility
+
+DeepSeek's own `@deepseek-ai/dsh-acp` remains the automation-only reference
+surface; HarnessDesk continues to use this adapter for renderer-facing
+sessions. The opt-in probe checks only the official bridge's `initialize` and
+`session/new` automation boundary, without prompting a model or requiring an
+API call. Run it against an initialized official `acp` profile:
+
+```bash
+DSH_OFFICIAL_BIN=/path/to/deepseek-harness/apps/cli/lib/bin.js \
+DSH_OFFICIAL_CWD=/path/to/deepseek-harness \
+DSH_OFFICIAL_ARGS='["--profile","acp"]' \
+npm run test:official
+```
+
+The default `npm test` suite skips this probe unless `DSH_OFFICIAL_BIN` is
+provided, so unit tests remain credential-free and deterministic.
 
 Then point a client at the binary:
 
@@ -202,7 +225,7 @@ Add an entry to `~/.harnessdesk/agents.json`:
 | key | meaning |
 |---|---|
 | `provider` | provider route for created agents, e.g. `deepseek-official` |
-| `model` | model for created agents, e.g. `deepseek-v4-pro` |
+| `model` | model for created agents, e.g. `deepseek-flash` |
 | `models` | models to offer in the picker; fewer than two offers none |
 | `efforts` | reasoning levels to offer; defaults to `off, low, high, max` |
 
@@ -331,7 +354,7 @@ from a truncated first prompt into "Maximum landing score breakdown":
     maxOutputTokens: 64
     timeoutMs: 60000
     provider: deepseek-official
-    model: deepseek-v4-flash
+    model: deepseek-flash
 ```
 
 The service alone gives a word-count fallback title; the provider names the

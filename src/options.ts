@@ -14,7 +14,7 @@
 export interface AdapterConfig {
   /** Provider route for created agents, e.g. `deepseek-official`. */
   readonly provider?: string
-  /** Model for created agents, e.g. `deepseek-v4-pro`. */
+  /** Model for created agents, e.g. `deepseek-flash`. */
   readonly model?: string
   /** Models to offer. A single-entry list is not offered at all. */
   readonly models?: readonly string[]
@@ -31,6 +31,9 @@ export const EFFORTS = ['off', 'low', 'high', 'max'] as const
 export const MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 
 const LABELS: Readonly<Record<string, string>> = {
+  'deepseek-flash': 'DeepSeek V4.1 Flash',
+  'deepseek-v4-pro': 'DeepSeek V4 Pro',
+  'deepseek-v4-flash': 'DeepSeek V4 Flash',
   'read-only': 'Read only',
   'workspace-write': 'Workspace write',
   'danger-full-access': 'Full access',
