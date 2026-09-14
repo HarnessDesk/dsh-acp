@@ -151,7 +151,7 @@ Mount the plugin in a harness composition, alongside an agent spine:
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
     provider: deepseek-official
-    model: deepseek-v4-pro
+    model: deepseek-flash
 
 - id: acp
   name: '@harnessdesk/dsh-acp'

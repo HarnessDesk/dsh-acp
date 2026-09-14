@@ -19,17 +19,17 @@ const jsonArgs = (): string[] => {
 }
 
 const callOfficial = async (bin: string, args: readonly string[]): Promise<JsonObject> => {
-  const dshHome = process.env['DSH_HOME'] ?? await mkdtemp(join(tmpdir(), 'harnessdesk-official-acp-'))
   const cwd = await mkdtemp(join(tmpdir(), 'harnessdesk-official-cwd-'))
   const child = spawn(bin, args, {
     cwd: process.env['DSH_OFFICIAL_CWD'] ?? process.cwd(),
-    env: { ...process.env, DSH_HOME: dshHome },
+    env: process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
 
   let buffer = ''
   let nextId = 0
   let stderr = ''
+  let processError: Error | undefined
   const pending = new Map<number, { resolve: (value: JsonObject) => void; reject: (error: Error) => void }>()
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (chunk: string) => { stderr += chunk })
@@ -37,11 +37,17 @@ const callOfficial = async (bin: string, args: readonly string[]): Promise<JsonO
     for (const request of pending.values()) request.reject(error)
     pending.clear()
   }
-  child.once('error', (error) => rejectPending(error))
+  child.once('error', (error) => {
+    processError = error
+    rejectPending(error)
+  })
   child.once('exit', (code, signal) => {
-    if (code !== 0 || signal !== null) {
-      rejectPending(new Error(`official ACP exited (${code ?? signal}); stderr: ${stderr}`))
-    }
+    processError = new Error(`official ACP exited (${code ?? signal}); stderr: ${stderr}`)
+    rejectPending(processError)
+  })
+  child.stdin.on('error', (error) => {
+    processError = error
+    rejectPending(error)
   })
   child.stdout.setEncoding('utf8')
   child.stdout.on('data', (chunk: string) => {
@@ -52,7 +58,12 @@ const callOfficial = async (bin: string, args: readonly string[]): Promise<JsonO
       const line = buffer.slice(0, newline).trim()
       buffer = buffer.slice(newline + 1)
       if (line.length === 0) continue
-      const message = JSON.parse(line) as JsonObject
+      let message: JsonObject
+      try {
+        message = JSON.parse(line) as JsonObject
+      } catch {
+        continue
+      }
       const id = message['id']
       if (typeof id !== 'number') continue
       const request = pending.get(id)
@@ -64,18 +75,59 @@ const callOfficial = async (bin: string, args: readonly string[]): Promise<JsonO
     }
   })
 
-  const call = (method: string, params: JsonObject): Promise<JsonObject> => {
+  const call = (method: string, params: JsonObject): Promise<JsonObject> => new Promise((resolve, reject) => {
+    const stopped = processError ?? (child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed
+      ? new Error(`official ACP exited before ${method}; stderr: ${stderr}`)
+      : undefined)
+    if (stopped !== undefined) {
+      reject(stopped)
+      return
+    }
     const id = ++nextId
-    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      reject(new Error(`${method} timed out; stderr: ${stderr}`))
+    }, 20_000)
+    pending.set(id, {
+      resolve: (value) => { clearTimeout(timer); resolve(value) },
+      reject: (error) => { clearTimeout(timer); reject(error) },
+    })
+    try {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`, (error) => {
+        if (error == null) return
+        const request = pending.get(id)
+        if (request === undefined) return
         pending.delete(id)
-        reject(new Error(`${method} timed out; stderr: ${stderr}`))
-      }, 20_000)
-      pending.set(id, {
-        resolve: (value) => { clearTimeout(timer); resolve(value) },
-        reject: (error) => { clearTimeout(timer); reject(error) },
+        request.reject(error)
       })
+    } catch (error) {
+      pending.delete(id)
+      clearTimeout(timer)
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  })
+
+  const stop = async (): Promise<void> => {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    child.kill('SIGTERM')
+    await new Promise<void>((resolve) => {
+      let softTimer: ReturnType<typeof setTimeout> | undefined
+      let hardTimer: ReturnType<typeof setTimeout> | undefined
+      const finish = (): void => {
+        if (softTimer !== undefined) clearTimeout(softTimer)
+        if (hardTimer !== undefined) clearTimeout(hardTimer)
+        child.removeListener('exit', finish)
+        resolve()
+      }
+      child.once('exit', finish)
+      softTimer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          finish()
+          return
+        }
+        child.kill('SIGKILL')
+        hardTimer = setTimeout(finish, 1_000)
+      }, 1_000)
     })
   }
 
@@ -91,12 +143,8 @@ const callOfficial = async (bin: string, args: readonly string[]): Promise<JsonO
     return session
   } finally {
     rejectPending(new Error('official ACP process stopped'))
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGTERM')
-      await new Promise<void>((resolve) => child.once('exit', () => resolve()))
-    }
+    await stop()
     await rm(cwd, { recursive: true, force: true })
-    if (process.env['DSH_HOME'] === undefined) await rm(dshHome, { recursive: true, force: true })
   }
 }
 
