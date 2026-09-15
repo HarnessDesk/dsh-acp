@@ -32,7 +32,7 @@ import type { AcpUpdate, DshEvent } from './types.ts'
  * differently once installed. A test pins it to `package.json`, which is what
  * makes a hand-edited constant safe.
  */
-export const VERSION = '0.5.2'
+export const VERSION = '0.5.3'
 
 /** One ACP session and the harness agent behind it. */
 interface Record_ {
