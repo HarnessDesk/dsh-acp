@@ -49,6 +49,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:official": "vitest run test/official-acp.test.ts",
     "test:watch": "vitest",
     "verify": "npm run typecheck && npm run test && npm run build"
   },

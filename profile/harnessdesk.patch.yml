@@ -17,7 +17,7 @@
       name: '@harnessdesk/dsh-acp'
       config:
         provider: deepseek-official
-        model: deepseek-v4-flash
+        model: deepseek-flash
         models:
-          - deepseek-v4-flash
+          - deepseek-flash
           - deepseek-v4-pro
